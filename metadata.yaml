@@ -1,0 +1,6 @@
+name: astrbot_plugin_qinglong
+display_name: 青龙面板管理
+desc: 通过聊天管理青龙面板，支持任务管理、环境变量、日志查看、自动推送及定时推送
+version: v1.3.3
+author: Haitun
+repo: https://gitee.com/tension0712/astrbot_plugin_qinglong

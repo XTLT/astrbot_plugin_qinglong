@@ -1,0 +1,72 @@
+{
+  "qinglong_host": {
+    "type": "string",
+    "default": "http://localhost:5700",
+    "description": "青龙面板地址"
+  },
+  "qinglong_client_id": {
+    "type": "string",
+    "default": "",
+    "description": "青龙面板应用ID（在青龙面板系统设置-应用设置中创建）"
+  },
+  "qinglong_client_secret": {
+    "type": "string",
+    "default": "",
+    "description": "青龙面板应用密钥"
+  },
+  "log_push_groups": {
+    "type": "list",
+    "default": [],
+    "description": "接收任务日志的群号列表，如 [\"机器人名称:GroupMessage:123456\", \"机器人名称:GroupMessage:789012\"]"
+  },
+  "log_push_friends": {
+    "type": "list",
+    "default": [],
+    "description": "接收任务日志的好友QQ号列表，如 [\"机器人名称:FriendMessage:111111\", \"机器人名称:FriendMessage:222222\"]"
+  },
+  "log_push_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "是否启用任务日志推送"
+  },
+  "log_push_timeout": {
+    "type": "int",
+    "default": 120,
+    "description": "日志获取超时时间（秒），建议不小于60秒"
+  },
+  "log_schedule_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "是否启用定时日志推送"
+  },
+  "log_schedule_time": {
+    "type": "string",
+    "default": "08:00,18:00",
+    "description": "定时推送时间(以服务器时区为准)，格式如: 08:00,18:00"
+  },
+  "log_schedule_groups": {
+    "type": "list",
+    "default": [],
+    "description": "接收定时推送的群号列表，如 [\"机器人名称:GroupMessage:123456\", \"机器人名称:GroupMessage:789012\"]"
+  },
+  "log_schedule_friends": {
+    "type": "list",
+    "default": [],
+    "description": "接收定时推送的好友QQ号列表，如 [\"机器人名称:FriendMessage:111111\", \"机器人名称:FriendMessage:222222\"]"
+  },
+  "log_retention_days": {
+    "type": "int",
+    "default": 7,
+    "description": "日志保留天数，超过天数的日志将被清理"
+  },
+  "log_schedule_display_count": {
+    "type": "int",
+    "default": 10,
+    "description": "定时推送显示的任务数量"
+  },
+  "log_error_display_lines": {
+    "type": "int",
+    "default": 50,
+    "description": "错误日志显示的最大行数，设为0表示显示完整错误日志"
+  }
+}
