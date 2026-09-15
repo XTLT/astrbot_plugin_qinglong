@@ -1070,7 +1070,7 @@ class LogScheduleManager:
         return f"✅ 已设置错误日志显示为: {lines_text}"
 
 
-@register("astrbot_plugin_qinglong", "Haitun", "青龙面板管理插件", "1.3.3")
+@register("astrbot_plugin_qinglong_manage", "Haitun", "青龙面板管理插件", "1.3.3")
 class QinglongPlugin(Star):
     """AstrBot 青龙插件主类"""
     
