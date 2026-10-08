@@ -148,5 +148,70 @@
     "type": "string",
     "default": "https://plogin.m.jd.com/cgi/ml/getCookie",
     "description": "京东获取Cookie接口地址"
+  },
+  "jd_browser_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "是否启用浏览器登录助手（真实 Chromium + 打码平台破解验证码，替代已被京东风控的纯HTTP发码）"
+  },
+  "jd_browser_headless": {
+    "type": "bool",
+    "default": true,
+    "description": "是否以无头模式运行 Chromium（服务器上建议保持 true）"
+  },
+  "jd_browser_auto_install": {
+    "type": "bool",
+    "default": true,
+    "description": "首次使用时是否自动下载安装 Chromium（约130MB，仅一次）"
+  },
+  "jd_browser_max_concurrent": {
+    "type": "int",
+    "default": 1,
+    "description": "同时进行的浏览器登录会话数（每会话约占用200-400MB内存，建议1）"
+  },
+  "jd_browser_max_retry": {
+    "type": "int",
+    "default": 4,
+    "description": "验证码破解失败后的换题重试次数"
+  },
+  "jd_browser_rotate_px_per_deg": {
+    "type": "string",
+    "default": "1.0",
+    "description": "旋转验证码：拖动像素/角度 映射系数（默认1px=1度，实测校准）"
+  },
+  "jd_browser_rotate_direction": {
+    "type": "int",
+    "default": 1,
+    "description": "旋转验证码拖动方向：1 或 -1"
+  },
+  "jd_captcha_username": {
+    "type": "string",
+    "default": "",
+    "description": "打码平台账号（图鉴 https://www.ttshitu.com 注册免费送测试点数），用于识别京东旋转/轨迹验证码"
+  },
+  "jd_captcha_password": {
+    "type": "string",
+    "default": "",
+    "description": "打码平台密码"
+  },
+  "jd_captcha_api_url": {
+    "type": "string",
+    "default": "http://api.ttshitu.com/predict",
+    "description": "打码平台识别接口地址"
+  },
+  "jd_captcha_rotate_typeid": {
+    "type": "string",
+    "default": "29",
+    "description": "旋转验证码识别类型（图鉴29=旋转类型）"
+  },
+  "jd_captcha_track_typeid": {
+    "type": "string",
+    "default": "48",
+    "description": "轨迹验证码识别类型（图鉴48=轨迹类型）"
+  },
+  "jd_captcha_gap_typeid": {
+    "type": "string",
+    "default": "33",
+    "description": "缺口验证码识别类型（图鉴33=单缺口返回X坐标）"
   }
 }

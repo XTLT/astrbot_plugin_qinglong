@@ -370,6 +370,568 @@ class JDSmsLogin:
             return False, f"获取Cookie请求异常: {e}", {}
 
 
+class BrowserLoginHelper:
+    """京东短信登录浏览器助手（Playwright 真实浏览器 + 打码平台识别验证码）
+
+    背景：京东短信登录存在强风控（纯 HTTP 调 sendCode 返回 403，且登录页
+    必须过滑块/旋转/轨迹类验证码）。本类用 Playwright 驱动真实 Chromium，
+    让浏览器自身执行京东 JS 加密，只把"识别验证码"这一步交给打码平台
+    （默认图鉴 ttshitu，可在插件配置中更换账号），自动完成：
+    打开登录页 → 输入手机号 → 触发并破解验证码 → 发短信 → 
+    用户回传验证码后登录并提取 Cookie。
+
+    特性：
+    - 每个登录会话独立 BrowserContext，用户之间完全隔离，互不串号
+    - Chromium 首次使用时自动安装；Linux 缺失系统依赖时提示修复命令
+    - 验证码破解失败自动刷新换题重试（京东题型随机：旋转/轨迹/缺口）
+    - 并发登录数可配置（默认同时 1 个，避免多浏览器实例吃内存）
+    """
+
+    JD_LOGIN_URL = "https://passport.jd.com/uc/login"
+
+    def __init__(self, config: dict, plugin: 'QinglongPlugin'):
+        self.config = config
+        self.plugin = plugin
+        self._pw = None
+        self._browser = None
+        self._install_lock = asyncio.Lock()
+        self._sessions: Dict[str, dict] = {}  # session_id -> {context, page, phone}
+        self._sem = asyncio.Semaphore(int(config.get("jd_browser_max_concurrent", 1)))
+
+    # ------------------------------------------------------------------
+    # 浏览器安装与启动
+    # ------------------------------------------------------------------
+    def _chromium_executable(self) -> Optional[str]:
+        """返回 Playwright 管理的 Chromium 可执行文件路径（未安装则为 None）"""
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                return p.chromium.executable_path
+        except Exception:
+            return None
+
+    async def _run_cmd(self, cmd: list) -> Tuple[bool, str]:
+        """在子进程执行命令，返回 (ok, 输出尾部)"""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
+            text = (out or b"").decode("utf-8", "ignore")
+            return proc.returncode == 0, text[-500:]
+        except asyncio.TimeoutError:
+            return False, "安装超时"
+        except Exception as e:
+            return False, str(e)
+
+    async def ensure_browser(self) -> Tuple[bool, str]:
+        """检测 / 自动安装 / 启动 Chromium。返回 (ok, 消息)"""
+        async with self._install_lock:
+            if self._browser:
+                return True, "ok"
+            import sys, os
+
+            # 1. 检查是否已安装
+            exe = self._chromium_executable()
+            if not exe or not os.path.exists(exe):
+                if not self.config.get("jd_browser_auto_install", True):
+                    return False, (
+                        "Chromium 未安装且已关闭自动安装。请在服务器上执行：\n"
+                        f"{sys.executable} -m playwright install chromium\n"
+                        "Linux 下如缺系统库再执行："
+                        f"{sys.executable} -m playwright install-deps chromium"
+                    )
+                logger.info("Chromium 未安装，开始自动下载（首次约 130MB，请稍候）…")
+                ok, msg = await self._run_cmd([sys.executable, "-m", "playwright", "install", "chromium"])
+                if not ok:
+                    return False, f"Chromium 自动安装失败：{msg}\n请手动执行安装命令后重试"
+                # Linux 下尝试补系统依赖（失败不阻塞，启动时再报）
+                if os.name == "posix":
+                    await self._run_cmd([sys.executable, "-m", "playwright", "install-deps", "chromium"])
+            else:
+                logger.info(f"Chromium 已就绪: {exe}")
+
+            # 2. 启动
+            try:
+                from playwright.async_api import async_playwright
+                self._pw = await async_playwright().start()
+                self._browser = await self._pw.chromium.launch(
+                    headless=bool(self.config.get("jd_browser_headless", True)),
+                    args=["--disable-blink-features=AutomationControlled"],
+                )
+                return True, "ok"
+            except Exception as e:
+                err = str(e)
+                if "Missing dependencies" in err or "error while loading shared libraries" in err:
+                    import sys
+                    return False, (
+                        "Chromium 缺少系统依赖库。请在服务器执行（需 root）：\n"
+                        f"{sys.executable} -m playwright install-deps chromium"
+                    )
+                return False, f"浏览器启动失败: {err}"
+
+    # ------------------------------------------------------------------
+    # 打码平台（图鉴 ttshitu）
+    # ------------------------------------------------------------------
+    def _captcha_ready(self) -> Tuple[bool, str]:
+        """打码平台是否已配置"""
+        user = (self.config.get("jd_captcha_username") or "").strip()
+        pwd = (self.config.get("jd_captcha_password") or "").strip()
+        if user and pwd:
+            return True, ""
+        return False, (
+            "未配置打码平台账号（京东验证码为旋转/轨迹题，需打码平台识别）。\n"
+            "请注册 https://www.ttshitu.com （免费送测试点数），在插件配置中填写 "
+            "jd_captcha_username / jd_captcha_password"
+        )
+
+    async def _ttshitu(self, image_b64: str, typeid: str, imageback_b64: str = "") -> Tuple[bool, str]:
+        """调用图鉴通用识别接口。返回 (ok, result)"""
+        try:
+            payload = {
+                "username": (self.config.get("jd_captcha_username") or "").strip(),
+                "password": (self.config.get("jd_captcha_password") or "").strip(),
+                "typeid": typeid,
+                "image": image_b64,
+            }
+            if imageback_b64:
+                payload["imageback"] = imageback_b64
+            url = self.config.get("jd_captcha_api_url", "http://api.ttshitu.com/predict")
+            timeout = httpx.Timeout(60.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(url, json=payload)
+                data = resp.json()
+            if data.get("success"):
+                result = data.get("data", {}).get("result", "")
+                return True, str(result).strip()
+            return False, data.get("message", "识别失败")
+        except Exception as e:
+            return False, f"打码平台调用异常: {e}"
+
+    # ------------------------------------------------------------------
+    # 验证码题型识别与破解
+    # ------------------------------------------------------------------
+    def _detect_type(self, page) -> str:
+        """检测当前验证码题型：rotate(旋转摆正) / track(轨迹绘制) / gap(缺口拼图) / unknown"""
+        try:
+            has_slider = page.query_selector(".captcha_drop #slider-div") is not None
+            if has_slider:
+                return "rotate"
+            text = page.evaluate("""() => {
+                const d = document.querySelector('.captcha_drop');
+                return d ? (d.innerText || '') : '';
+            }""")
+            if "轨迹" in text or "绘制" in text:
+                return "track"
+            if page.query_selector(".captcha_drop canvas") is not None:
+                return "gap"
+            return "unknown"
+        except Exception:
+            return "unknown"
+
+    def _extract_image_b64(self, page) -> Optional[str]:
+        """提取验证码弹窗中的主图 base64（去掉 data: 前缀）"""
+        try:
+            src = page.evaluate("""() => {
+                const d = document.querySelector('.captcha_drop .slot-content img');
+                return d ? d.src : '';
+            }""")
+            if not src or "," not in src:
+                return None
+            return src.split(",", 1)[1]
+        except Exception:
+            return None
+
+    def _parse_angle(self, result: str) -> Optional[int]:
+        """解析打码平台返回的旋转角度（支持 ±数字、纯数字）"""
+        m = re.search(r"[-+]?\d+", result or "")
+        return int(m.group(0)) if m else None
+
+    def _parse_track_points(self, result: str) -> Optional[List[Tuple[int, int]]]:
+        """解析轨迹点坐标：尝试多种格式"""
+        pts = []
+        try:
+            # JSON 数组 [[x,y],...]
+            import json as _json
+            obj = _json.loads(result)
+            if isinstance(obj, list):
+                for item in obj:
+                    if isinstance(item, (list, tuple)) and len(item) >= 2:
+                        pts.append((int(item[0]), int(item[1])))
+                return pts if len(pts) >= 2 else None
+        except Exception:
+            pass
+        # 分隔符形式 "x1,y1;x2,y2;..." 或 "x1,y1|x2,y2" 或空格
+        for sep in (";", "|", "\n", " "):
+            parts = [p for p in result.split(sep) if p.strip()]
+            if len(parts) >= 2 and all("," in p for p in parts):
+                ok = True
+                for p in parts:
+                    try:
+                        x, y = p.split(",")
+                        pts.append((int(x), int(y)))
+                    except Exception:
+                        ok = False
+                        break
+                if ok and len(pts) >= 2:
+                    return pts
+                pts = []
+        return None
+
+    async def _drag_human(self, page, start_x: float, start_y: float, distance: float, y_jitter: float = 2.0):
+        """类人拖动：先快后慢 + 轻微抖动"""
+        import random
+        await page.mouse.move(start_x, start_y)
+        await page.mouse.down()
+        await asyncio.sleep(0.1)
+        distance = max(distance, 1)
+        steps = max(int(distance / 3), 6)
+        # 前 60% 走完 80% 距离（快），后 40% 走完 20%（慢，对齐）
+        fast_end = int(steps * 0.6)
+        for i in range(1, steps + 1):
+            if i <= fast_end:
+                x = start_x + distance * (0.8 * i / fast_end)
+            else:
+                x = start_x + distance * (0.8 + 0.2 * (i - fast_end) / (steps - fast_end))
+            y = start_y + random.uniform(-y_jitter, y_jitter)
+            await page.mouse.move(x, y, steps=2)
+            await asyncio.sleep(random.uniform(0.012, 0.035))
+        await page.mouse.up()
+        await asyncio.sleep(0.3)
+
+    async def _solve_rotate(self, page) -> Tuple[bool, str]:
+        """破解旋转摆正题：打码识别角度 → 拖动"""
+        img_b64 = self._extract_image_b64(page)
+        if not img_b64:
+            return False, "未获取到旋转图片"
+        ok, result = await self._ttshitu(img_b64, str(self.config.get("jd_captcha_rotate_typeid", "29")))
+        if not ok:
+            return False, f"角度识别失败: {result}"
+        angle = self._parse_angle(result)
+        if angle is None:
+            return False, f"角度识别结果异常: {result}"
+        # 拖动距离 = 角度 * px/度（方向与比例可配置，实测校准）
+        px_per_deg = float(self.config.get("jd_browser_rotate_px_per_deg", 1.0))
+        direction = int(self.config.get("jd_browser_rotate_direction", 1))
+        distance = (angle % 360) * px_per_deg * direction
+        if distance < 0:
+            distance = 360 * px_per_deg + distance  # 负方向换算为正方向拖动
+        slide = page.query_selector("#slider-div")
+        if not slide:
+            return False, "未找到滑块按钮"
+        box = slide.bounding_box()
+        if not box:
+            return False, "滑块位置不可用"
+        logger.info(f"旋转题: 识别角度={angle}°, 拖动距离={int(distance)}px")
+        await self._drag_human(page, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, distance)
+        return True, f"已按 {angle}° 拖动"
+
+    async def _solve_track(self, page) -> Tuple[bool, str]:
+        """破解轨迹绘制题：打码识别轨迹坐标 → 在图上绘制"""
+        img_b64 = self._extract_image_b64(page)
+        if not img_b64:
+            return False, "未获取到轨迹图"
+        ok, result = await self._ttshitu(img_b64, str(self.config.get("jd_captcha_track_typeid", "48")))
+        if not ok:
+            return False, f"轨迹识别失败: {result}"
+        pts = self._parse_track_points(result)
+        if not pts:
+            return False, f"轨迹坐标解析失败: {result[:60]}"
+        # 图片在 slot-content 内，需要相对页面的绝对坐标
+        img_box = page.evaluate("""() => {
+            const el = document.querySelector('.captcha_drop .slot-content img');
+            if (!el) return null;
+            const r = el.getBoundingClientRect();
+            return {x: r.x, y: r.y, w: r.width, h: r.height, nw: el.naturalWidth, nh: el.naturalHeight};
+        }""")
+        if not img_box:
+            return False, "未找到轨迹图位置"
+        scale_x = img_box["w"] / max(img_box["nw"], 1)
+        scale_y = img_box["h"] / max(img_box["nh"], 1)
+        logger.info(f"轨迹题: 识别到 {len(pts)} 个轨迹点")
+        # 起点按下，逐点移动，终点松开
+        first = True
+        for (px, py) in pts:
+            abs_x = img_box["x"] + px * scale_x
+            abs_y = img_box["y"] + py * scale_y
+            if first:
+                await page.mouse.move(abs_x, abs_y)
+                await page.mouse.down()
+                await asyncio.sleep(0.15)
+                first = False
+            else:
+                await page.mouse.move(abs_x, abs_y, steps=2)
+                await asyncio.sleep(0.03)
+        await page.mouse.up()
+        return True, f"已按 {len(pts)} 个轨迹点绘制"
+
+    async def _solve_gap(self, page) -> Tuple[bool, str]:
+        """破解缺口拼图题：图鉴单缺口识别（typeid 33）返回 X 坐标 → 拖动"""
+        img_b64 = self._extract_image_b64(page)
+        if not img_b64:
+            return False, "未获取到缺口图"
+        ok, result = await self._ttshitu(img_b64, str(self.config.get("jd_captcha_gap_typeid", "33")))
+        if not ok:
+            return False, f"缺口识别失败: {result}"
+        x = self._parse_angle(result)
+        if x is None:
+            return False, f"缺口坐标异常: {result}"
+        slide = page.query_selector("#slider-div")
+        if not slide:
+            return False, "未找到滑块按钮"
+        box = slide.bounding_box()
+        if not box:
+            return False, "滑块位置不可用"
+        # 缺口 X 坐标需减去滑块按钮宽度，并乘图片缩放比例
+        scale = 1.0
+        img_box = page.evaluate("""() => {
+            const el = document.querySelector('.captcha_drop .slot-content img');
+            if (!el) return null;
+            const r = el.getBoundingClientRect();
+            return {w: r.width, nw: el.naturalWidth};
+        }""")
+        if img_box and img_box["nw"]:
+            scale = img_box["w"] / img_box["nw"]
+        distance = x * scale - box["width"] * 0.5
+        logger.info(f"缺口题: 识别X={x}, 拖动距离={int(distance)}px")
+        await self._drag_human(page, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, distance)
+        return True, f"已按缺口 X={x} 拖动"
+
+    async def _refresh_captcha(self, page):
+        """点击验证码弹窗的刷新按钮换题"""
+        try:
+            await page.evaluate("""() => { const r = document.querySelector('.jcap_refresh'); if (r) r.click(); }""")
+        except Exception:
+            pass
+        await asyncio.sleep(2)
+
+    async def _wait_captcha_gone(self, page, timeout_s: float = 10.0) -> bool:
+        """等待验证码弹窗消失（=破解成功）"""
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            try:
+                if page.query_selector(".captcha_drop") is None:
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        return False
+
+    async def _wait_sms_sent(self, page, timeout_s: float = 20.0) -> Tuple[bool, str]:
+        """验证码弹窗消失后，等待京东真正发出短信（按钮进入倒计时或出现提示）"""
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            try:
+                btn = page.query_selector("#send-sms-code-btn")
+                if btn:
+                    txt = btn.inner_text().strip()
+                    disabled = btn.is_disabled()
+                    if disabled and any(k in txt for k in ("s", "秒", "重新")):
+                        return True, f"验证码已发送（{txt}）"
+                # 或页面出现发送成功提示
+                body = page.evaluate("() => document.body.innerText || ''")
+                if "验证码已发送" in body or "发送成功" in body:
+                    return True, "验证码已发送"
+            except Exception:
+                pass
+            await asyncio.sleep(0.8)
+        # 兜底：弹窗已消失视为发送成功
+        return True, "验证码已发送"
+
+    # ------------------------------------------------------------------
+    # 主流程
+    # ------------------------------------------------------------------
+    async def start_sms_login(self, session_id: str, phone: str) -> Tuple[bool, str]:
+        """第一步：打开登录页 → 输入手机号 → 破解验证码 → 等待发码。
+        成功后将浏览器会话保存在 self._sessions[session_id]，等待用户回传验证码。
+        """
+        ok, msg = await self._captcha_ready()
+        if not ok:
+            return False, msg
+
+        async with self._sem:
+            ok, msg = await self.ensure_browser()
+            if not ok:
+                return False, msg
+
+            context = await self._browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                ),
+                locale="zh-CN",
+                viewport={"width": 1280, "height": 900},
+            )
+            page = await context.new_page()
+            try:
+                await page.goto(self.JD_LOGIN_URL, timeout=60000, wait_until="domcontentloaded")
+                await asyncio.sleep(5)
+                # 切到短信登录 tab
+                await page.evaluate("""() => { document.querySelector('#sms-login').click(); }""")
+                await asyncio.sleep(1.5)
+                # 输入手机号
+                mb = page.query_selector("#mobile-number")
+                if not mb:
+                    await context.close()
+                    return False, "登录页未加载完整（短信表单未出现），请稍后重试"
+                await mb.click(force=True)
+                await page.keyboard.type(phone, delay=40)
+                await asyncio.sleep(0.5)
+                # 点击获取验证码
+                await page.evaluate("""() => { document.querySelector('#send-sms-code-btn').click(); }""")
+                # 等待验证码弹窗
+                appeared = False
+                for _ in range(30):
+                    if page.query_selector(".captcha_drop"):
+                        appeared = True
+                        break
+                    await asyncio.sleep(0.5)
+                if not appeared:
+                    # 可能直接发码成功（未弹验证码），或提示错误
+                    await asyncio.sleep(3)
+                    body = await page.evaluate("() => document.body.innerText || ''")
+                    if "验证码已发送" in body or "发送成功" in body:
+                        self._sessions[session_id] = {"context": context, "page": page, "phone": phone}
+                        return True, "ok"
+                    await context.close()
+                    return False, f"未弹出验证码且未发送成功：{body[:120]}"
+
+                # 破解验证码（重试循环）
+                max_retry = max(int(self.config.get("jd_browser_max_retry", 4)), 1)
+                last_err = "验证码破解失败"
+                for attempt in range(max_retry):
+                    await asyncio.sleep(2)  # 等验证码内容加载
+                    ctype = self._detect_type(page)
+                    logger.info(f"验证码破解尝试 {attempt+1}/{max_retry}: 题型={ctype}")
+                    if ctype == "rotate":
+                        ok, last_err = await self._solve_rotate(page)
+                    elif ctype == "track":
+                        ok, last_err = await self._solve_track(page)
+                    elif ctype == "gap":
+                        ok, last_err = await self._solve_gap(page)
+                    else:
+                        ok, last_err = False, "未识别的验证码题型"
+                    if not ok:
+                        await self._refresh_captcha(page)
+                        continue
+                    # 拖动完成，等弹窗消失判定成败
+                    gone = await self._wait_captcha_gone(page)
+                    if gone:
+                        break
+                    last_err = "验证码未通过（可能识别角度/轨迹不准）"
+                    await self._refresh_captcha(page)
+
+                if not gone:
+                    await context.close()
+                    return False, f"{last_err}（已重试 {max_retry} 次，请稍后再试）"
+
+                # 验证通过，等待短信发送
+                sent, msg2 = await self._wait_sms_sent(page)
+                if not sent:
+                    await context.close()
+                    return False, msg2
+                self._sessions[session_id] = {"context": context, "page": page, "phone": phone}
+                return True, "ok"
+
+            except Exception as e:
+                logger.error(f"浏览器登录流程异常: {e}")
+                logger.error(traceback.format_exc())
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+                return False, f"浏览器登录流程异常: {e}"
+
+    async def submit_sms_code(self, session_id: str, code: str) -> Tuple[bool, str, str]:
+        """第二步：输入验证码 → 登录 → 提取 Cookie。返回 (ok, msg, cookie)"""
+        session = self._sessions.get(session_id)
+        if not session:
+            return False, "登录会话已失效，请重新发送手机号", ""
+        page = session["page"]
+        context = session["context"]
+        try:
+            code_input = page.query_selector("#sms-code")
+            if not code_input:
+                return False, "验证码输入框不可用", ""
+            await code_input.click(force=True)
+            await page.keyboard.type(code, delay=60)
+            await asyncio.sleep(0.5)
+            await page.evaluate("""() => { document.querySelector('#sms-login-submit').click(); }""")
+
+            # 等待跳转或错误提示（最长 20 秒）
+            login_url = page.url
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                await asyncio.sleep(0.8)
+                try:
+                    cur = page.url
+                    if "passport.jd.com" not in cur or "uc/login" not in cur:
+                        break  # 已跳转
+                    body = await page.evaluate("() => document.body.innerText || ''")
+                    if any(k in body for k in ("验证码错误", "验证码不正确", "输入错误", "验证码已过期")):
+                        return False, "验证码错误或已过期，请重新发送手机号获取新验证码", ""
+                except Exception:
+                    pass
+
+            # 提取 Cookie（pt_key / pt_pin）
+            await asyncio.sleep(2)
+            cookies = await context.cookies()
+            pairs = {}
+            for c in cookies:
+                if c["name"].startswith("pt_") and c["value"]:
+                    pairs[c["name"]] = c["value"]
+            cookie = ";".join(f"{k}={v}" for k, v in pairs.items())
+            if "pt_key=" in cookie and "pt_pin=" in cookie:
+                return True, "登录成功", cookie
+            # 未取到完整 cookie：再等一会重试一次
+            await asyncio.sleep(3)
+            cookies = await context.cookies()
+            pairs = {}
+            for c in cookies:
+                if c["name"].startswith("pt_") and c["value"]:
+                    pairs[c["name"]] = c["value"]
+            cookie = ";".join(f"{k}={v}" for k, v in pairs.items())
+            if "pt_key=" in cookie and "pt_pin=" in cookie:
+                return True, "登录成功", cookie
+            return False, "登录后未获取到完整 Cookie（pt_key/pt_pin），请重新尝试", cookie
+        except Exception as e:
+            logger.error(f"提交验证码异常: {e}")
+            logger.error(traceback.format_exc())
+            return False, f"提交验证码异常: {e}", ""
+        finally:
+            # 无论成败，结束会话释放浏览器资源
+            await self.close_session(session_id)
+
+    async def close_session(self, session_id: str):
+        """关闭单个登录会话"""
+        session = self._sessions.pop(session_id, None)
+        if not session:
+            return
+        try:
+            await session["context"].close()
+        except Exception:
+            pass
+
+    async def close_all(self):
+        """关闭全部浏览器会话与浏览器实例（插件卸载时调用）"""
+        for sid in list(self._sessions.keys()):
+            await self.close_session(sid)
+        try:
+            if self._browser:
+                await self._browser.close()
+        except Exception:
+            pass
+        try:
+            if self._pw:
+                await self._pw.stop()
+        except Exception:
+            pass
+        self._browser = None
+        self._pw = None
+
+
 class TaskLogMonitor:
     """任务日志监控器"""
     
@@ -1273,6 +1835,26 @@ class QinglongPlugin(Star):
                 config[key] = default
         if not isinstance(config.get("sms_enabled_groups"), list):
             config["sms_enabled_groups"] = []
+
+        # 浏览器登录助手配置默认值（真实 Chromium + 打码平台识别验证码）
+        browser_defaults = {
+            "jd_browser_enabled": True,
+            "jd_browser_headless": True,
+            "jd_browser_auto_install": True,
+            "jd_browser_max_concurrent": 1,
+            "jd_browser_max_retry": 4,
+            "jd_browser_rotate_px_per_deg": 1.0,
+            "jd_browser_rotate_direction": 1,
+            "jd_captcha_username": "",
+            "jd_captcha_password": "",
+            "jd_captcha_api_url": "http://api.ttshitu.com/predict",
+            "jd_captcha_rotate_typeid": "29",
+            "jd_captcha_track_typeid": "48",
+            "jd_captcha_gap_typeid": "33",
+        }
+        for key, default in browser_defaults.items():
+            if key not in config:
+                config[key] = default
         
         ql_host = config.get("qinglong_host", "http://localhost:5700")
         ql_client_id = config.get("qinglong_client_id", "")
@@ -1282,6 +1864,7 @@ class QinglongPlugin(Star):
         self.log_monitor = TaskLogMonitor(self.ql_api, self, config)
         self.schedule_manager = LogScheduleManager(self, config)
         self.jd_sms = JDSmsLogin(config)
+        self.browser_login = BrowserLoginHelper(config, self)
         self.last_task_log = None
         self.log_check_task = None
         self.check_interval = 30
@@ -1291,7 +1874,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.4.0)")
+        logger.info("青龙面板插件已加载 (v1.5.0)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -1641,7 +2224,41 @@ class QinglongPlugin(Star):
         
         # 清理该用户可能存在的旧会话
         self.sms_sessions.pop(user_id, None)
-        
+
+        browser_login = getattr(self, "browser_login", None)
+        if browser_login is not None and self.config.get("jd_browser_enabled", True):
+            # 浏览器助手发码（真实 Chromium + 打码平台破解验证码）
+            session_id = f"{user_id}_{uuid.uuid4().hex[:8]}"
+            ok, msg = await browser_login.start_sms_login(session_id, phone)
+            if not ok:
+                logger.warning(f"京东浏览器发码失败: 手机号={phone[:3]}****{phone[7:]}, 原因={msg}")
+                await self._sms_reply(
+                    event,
+                    f"❌ 验证码发送失败: {msg}\n"
+                    f"可能需要配置打码平台账号，或稍后重试"
+                )
+                return
+            self.sms_sessions[user_id] = {
+                "phone": phone,
+                "browser_session": session_id,
+                "sent_at": now,
+            }
+            self.sms_uid_cooldown[user_id] = now
+            self.sms_phone_cooldown[phone] = now
+            self.sms_intents.pop(user_id, None)  # 已进入发码阶段，清除登录意图
+
+            timeout_min = max(int(self.config.get("sms_session_timeout", 300)) // 60, 1)
+            masked_phone = phone[:3] + "****" + phone[7:]
+            logger.info(f"京东验证码已发送(浏览器): 用户={user_id}, 手机号={masked_phone}")
+            await self._sms_reply(
+                event,
+                f"📱 验证码已发送至 {masked_phone}\n"
+                f"请将收到的验证码发到群里完成登录\n"
+                f"⏰ {timeout_min} 分钟内有效"
+            )
+            return
+
+        # 回退：旧 HTTP 接口（京东已风控，一般不生效）
         uuid_str = str(uuid.uuid4())
         ok, msg, info = await self.jd_sms.send_code(phone, uuid_str)
         if not ok:
@@ -1687,34 +2304,47 @@ class QinglongPlugin(Star):
             return
         
         phone = session["phone"]
-        ok, msg, info = await self.jd_sms.check_code(
-            phone, code, session["uuid"], session.get("sms_key", "")
-        )
-        if not ok:
-            logger.warning(f"京东验证码校验失败: 用户={user_id}, 原因={msg}")
-            await self._sms_reply(event, f"❌ 验证码校验失败: {msg}\n请检查验证码是否正确，或重新发送手机号获取新验证码")
-            return
-        
-        ticket = info.get("ticket", "")
-        if not ticket:
-            self.sms_sessions.pop(user_id, None)
-            await self._sms_reply(event, "❌ 未获取到登录凭证（ticket），请重新发送手机号重试")
-            return
-        
-        ok2, msg2, info2 = await self.jd_sms.get_cookie(ticket)
-        if not ok2:
-            self.sms_sessions.pop(user_id, None)
-            await self._sms_reply(
-                event,
-                f"❌ 获取Cookie失败: {msg2}\n可能被风控拦截，请稍后重试"
+
+        cookie = ""
+        browser_session = session.get("browser_session")
+        browser_login = getattr(self, "browser_login", None)
+        if browser_session and browser_login is not None:
+            # 浏览器登录流程：输入验证码 → 登录 → 提取 Cookie
+            ok, msg, cookie = await browser_login.submit_sms_code(browser_session, code)
+            if not ok:
+                logger.warning(f"京东浏览器登录失败: 用户={user_id}, 原因={msg}")
+                await self._sms_reply(event, f"❌ 登录失败: {msg}\n请检查验证码是否正确，或重新发送手机号获取新验证码")
+                return
+        else:
+            # 回退：旧 HTTP 接口流程
+            ok, msg, info = await self.jd_sms.check_code(
+                phone, code, session["uuid"], session.get("sms_key", "")
             )
-            return
-        
-        cookie = info2.get("cookie", "")
-        if not cookie:
-            self.sms_sessions.pop(user_id, None)
-            await self._sms_reply(event, "❌ 获取到的Cookie为空，请重新发送手机号重试")
-            return
+            if not ok:
+                logger.warning(f"京东验证码校验失败: 用户={user_id}, 原因={msg}")
+                await self._sms_reply(event, f"❌ 验证码校验失败: {msg}\n请检查验证码是否正确，或重新发送手机号获取新验证码")
+                return
+
+            ticket = info.get("ticket", "")
+            if not ticket:
+                self.sms_sessions.pop(user_id, None)
+                await self._sms_reply(event, "❌ 未获取到登录凭证（ticket），请重新发送手机号重试")
+                return
+
+            ok2, msg2, info2 = await self.jd_sms.get_cookie(ticket)
+            if not ok2:
+                self.sms_sessions.pop(user_id, None)
+                await self._sms_reply(
+                    event,
+                    f"❌ 获取Cookie失败: {msg2}\n可能被风控拦截，请稍后重试"
+                )
+                return
+
+            cookie = info2.get("cookie", "")
+            if not cookie:
+                self.sms_sessions.pop(user_id, None)
+                await self._sms_reply(event, "❌ 获取到的Cookie为空，请重新发送手机号重试")
+                return
         
         # 复用 Cookie 保存/更新逻辑：按用户保存独立变量，同用户再登录自动更新
         nickname = self._get_sender_name(event)
@@ -2027,9 +2657,14 @@ class QinglongPlugin(Star):
             groups = self.config.get("sms_enabled_groups", [])
             cooldown = self.config.get("sms_cooldown_seconds", 60)
             active = len(self.sms_sessions)
+            browser_on = self.config.get("jd_browser_enabled", True)
+            captcha_user = (self.config.get("jd_captcha_username") or "").strip()
+            captcha_ok = "✅ 已配置" if captcha_user else "❌ 未配置（验证码将无法破解）"
             yield event.plain_result(
                 f"📱 京东短信登录状态:\n"
                 f"状态: {'🟢 已启用' if enabled else '🔴 已禁用'}\n"
+                f"浏览器登录: {'🟢 开启' if browser_on else '🔴 关闭'}\n"
+                f"打码平台: {captcha_ok}\n"
                 f"允许的群: {', '.join(str(g) for g in groups) if groups else '全部群'}\n"
                 f"发码间隔: {cooldown} 秒\n"
                 f"进行中的登录: {active} 个"
@@ -2048,7 +2683,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.3.3
+        help_text = """📦 青龙面板管理插件 v1.5.0
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
@@ -2760,6 +3395,10 @@ class QinglongPlugin(Star):
         
         if self.log_check_task and not self.log_check_task.done():
             self.log_check_task.cancel()
+        
+        browser_login = getattr(self, "browser_login", None)
+        if browser_login is not None:
+            await browser_login.close_all()
         
         await self.jd_sms.close()
         await self.ql_api.close()

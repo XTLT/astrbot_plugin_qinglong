@@ -1,4 +1,4 @@
-# AstrBot 青龙面板管理插件 v1.4.0
+# AstrBot 青龙面板管理插件 v1.5.0
 
 通过 AstrBot 管理青龙面板的环境变量和定时任务，支持任务执行日志自动推送和定时推送。
 
@@ -47,7 +47,7 @@
 
 ### v1.4.0 新增：京东短信验证码登录（自动更新 Cookie）
 
-群友在群里发送手机号，插件调用京东官方接口下发短信验证码；群友把收到的验证码发到群里，插件自动完成登录并把新 Cookie 保存/更新到该用户的青龙环境变量。
+群友在群里发送手机号，插件下发短信验证码；群友把收到的验证码发到群里，插件自动完成登录并把新 Cookie 保存/更新到该用户的青龙环境变量。
 
 **使用流程：**
 1. 群友在群里发送「登录」两个字，开始登录流程（**注意**：AstrBot 群聊默认需要唤醒机器人，建议 @机器人 + 登录，如 `@机器人 登录`；或在 AstrBot 配置的「唤醒前缀 wake_prefix」中加入 `登录`，即可直接发「登录」触发）
@@ -56,7 +56,7 @@
 4. 登录成功，插件自动保存/更新该用户的京东 Cookie（变量名与 Cookie 自动保存相同，如 `JD_COOKIE_昵称`）
 
 **管理命令：**
-- `/ql sms status` - 查看短信登录状态
+- `/ql sms status` - 查看短信登录状态（含打码平台配置状态）
 - `/ql sms enable` - 启用
 - `/ql sms disable` - 禁用
 
@@ -66,22 +66,44 @@
 - 验证码必须由发起登录的同一用户回传，他人无法冒用
 - 验证码流程 5 分钟有效（可配置）
 - 群内回复不暴露完整手机号（显示 `138****8000`）和完整 Cookie（显示掩码）
+- 每个用户独立浏览器登录会话，多账号互不串号
 
-**接口说明：** 京东 H5 登录接口（sendCode/checkCode/getCookie）参数可能随京东风控策略调整，接口地址与 appId/sceneid 均可在插件配置中修改，便于校准。
+### v1.5.0 新增：真实浏览器自动破解验证码（重点）
 
-**配置项（插件配置中设置）：**
+京东短信登录已启用强风控：纯 HTTP 调用发码接口会被 403 拦截，且必须通过旋转/轨迹类验证码。v1.5.0 起，插件内置 **Playwright 真实 Chromium** 完成登录：
+
+```
+发送手机号 → 自动打开京东登录页 → 输入手机号 → 自动破解验证码
+（旋转/轨迹题提交打码平台识别 → 模拟人类拖动/绘制）→ 京东发码
+→ 用户回传验证码 → 自动登录 → 提取 Cookie → 保存/更新到青龙
+```
+
+**部署前提（一次性）：**
+1. **安装浏览器依赖**：插件首次使用登录功能时自动下载 Chromium（约 130MB）；如遇系统依赖缺失，在服务器上执行（需 root）：
+   ```bash
+   python -m playwright install-deps chromium
+   ```
+2. **注册打码平台**（免费送测试点数）：https://www.ttshitu.com ，注册后在插件配置中填写 `jd_captcha_username` / `jd_captcha_password`。每次识别约几分钱，验证码识别失败会自动刷新换题重试。
+
+**新增配置项（插件配置中设置）：**
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| sms_login_enabled | true | 是否启用京东短信验证码登录 |
-| sms_enabled_groups | [] | 允许使用短信登录的群号列表，留空表示所有群 |
-| sms_cooldown_seconds | 60 | 同一手机号/用户的发码间隔（秒） |
-| sms_session_timeout | 300 | 验证码登录流程有效期（秒） |
-| sms_reply_enabled | true | 登录过程中是否群内回复提示 |
-| jd_sms_app_id | 20019 | 京东H5登录appId |
-| jd_sms_scene_id | 8 | 京东验证码校验sceneid |
-| jd_sms_send_url / jd_sms_check_url / jd_sms_cookie_url | 京东默认接口 | 三个接口地址，可校准 |
+| jd_browser_enabled | true | 是否启用浏览器登录助手 |
+| jd_browser_headless | true | 无头模式运行 Chromium |
+| jd_browser_auto_install | true | 首次使用自动下载 Chromium |
+| jd_browser_max_concurrent | 1 | 同时登录会话数（每会话占 200-400MB 内存） |
+| jd_browser_max_retry | 4 | 验证码破解失败换题重试次数 |
+| jd_browser_rotate_px_per_deg | 1.0 | 旋转验证码拖动像素/角度系数 |
+| jd_browser_rotate_direction | 1 | 旋转验证码拖动方向（1/-1） |
+| jd_captcha_username / jd_captcha_password | 空 | 图鉴打码平台账号密码 |
+| jd_captcha_api_url | api.ttshitu.com/predict | 打码平台接口地址 |
+| jd_captcha_rotate_typeid | 29 | 旋转题识别类型 |
+| jd_captcha_track_typeid | 48 | 轨迹题识别类型 |
+| jd_captcha_gap_typeid | 33 | 缺口题识别类型 |
 
-**注意：** 短信登录依赖京东公开接口，若接口调整可能导致功能不可用，需按抓包结果在校准配置；请遵守京东用户协议，仅用于本人账号的 Cookie 管理。
+**接口说明：** 旧版纯 HTTP 发码接口（sendCode/checkCode/getCookie）仍保留为回退路径（`jd_browser_enabled=false` 时使用），但京东已风控，一般不再生效。
+
+**注意：** 请遵守京东用户协议，仅用于本人账号的 Cookie 管理；验证码识别为打码平台提供的通用图像识别服务。
 
 ## 支持的配置格式
 
@@ -124,6 +146,7 @@
 - ✅ **完整错误日志显示**
 - ✅ **群内自动保存/更新 Cookie（v1.4.0 新增）**
 - ✅ **京东短信验证码登录（v1.4.0 新增）**
+- ✅ **真实浏览器自动破解验证码（v1.5.0 新增：Playwright + 打码平台）**
 
 ## 命令大全
 
