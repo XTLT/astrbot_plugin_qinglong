@@ -68,5 +68,85 @@
     "type": "int",
     "default": 50,
     "description": "错误日志显示的最大行数，设为0表示显示完整错误日志"
+  },
+  "cookie_auto_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "是否启用群内自动识别并保存Cookie"
+  },
+  "cookie_env_prefix": {
+    "type": "string",
+    "default": "JD_COOKIE",
+    "description": "Cookie环境变量名前缀，每个用户保存为 前缀_昵称，如 JD_COOKIE_张三"
+  },
+  "cookie_enabled_groups": {
+    "type": "list",
+    "default": [],
+    "description": "允许自动保存Cookie的群号列表，留空表示所有群"
+  },
+  "cookie_match_regex": {
+    "type": "string",
+    "default": "(?:[A-Za-z0-9_\\-]+=[^;\\s=]+)(?:;\\s*[A-Za-z0-9_\\-]+=[^;\\s=]+)+",
+    "description": "Cookie识别正则，需匹配 key=value;key=value 形式（至少两组）"
+  },
+  "cookie_min_pairs": {
+    "type": "int",
+    "default": 2,
+    "description": "识别为Cookie所需的最少键值对数量，防止误触发"
+  },
+  "cookie_reply_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "保存/更新成功后是否在群内回复提示（不显示完整Cookie值）"
+  },
+  "sms_login_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "是否启用京东短信验证码登录（群内发手机号→发验证码→验证码换Cookie）"
+  },
+  "sms_enabled_groups": {
+    "type": "list",
+    "default": [],
+    "description": "允许使用短信登录的群号列表，留空表示所有群"
+  },
+  "sms_cooldown_seconds": {
+    "type": "int",
+    "default": 60,
+    "description": "同一手机号/同一用户的发码间隔（秒），防止被滥用为短信轰炸"
+  },
+  "sms_session_timeout": {
+    "type": "int",
+    "default": 300,
+    "description": "验证码登录流程有效期（秒），超时需要重新发送手机号"
+  },
+  "sms_reply_enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "短信登录过程中是否在群内回复提示"
+  },
+  "jd_sms_app_id": {
+    "type": "int",
+    "default": 20019,
+    "description": "京东H5登录appId，接口参数变化时在此校准"
+  },
+  "jd_sms_scene_id": {
+    "type": "int",
+    "default": 8,
+    "description": "京东验证码校验sceneid，接口参数变化时在此校准"
+  },
+  "jd_sms_send_url": {
+    "type": "string",
+    "default": "https://plogin.m.jd.com/cgi/ml/sendCode",
+    "description": "京东发送验证码接口地址"
+  },
+  "jd_sms_check_url": {
+    "type": "string",
+    "default": "https://plogin.m.jd.com/cgi/ml/checkCode",
+    "description": "京东校验验证码接口地址"
+  },
+  "jd_sms_cookie_url": {
+    "type": "string",
+    "default": "https://plogin.m.jd.com/cgi/ml/getCookie",
+    "description": "京东获取Cookie接口地址"
   }
 }

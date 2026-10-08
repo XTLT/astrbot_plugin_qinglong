@@ -10,6 +10,7 @@ import time
 import asyncio
 import json
 import re
+import uuid
 import datetime
 import traceback
 from typing import Dict, List, Optional, Tuple, Any, Set
@@ -26,6 +27,11 @@ from astrbot.core.message.message_event_result import MessageChain
 # 常量配置
 DEFAULT_TIMEOUT = 10
 TOKEN_EXPIRE_SECONDS = 6 * 24 * 3600  # 6天
+
+# Cookie 自动保存相关常量
+# 默认匹配 key=value;key=value 形式的 Cookie（至少两组键值对）
+DEFAULT_COOKIE_REGEX = r"(?:[A-Za-z0-9_\-]+=[^;\s=]+)(?:;\s*[A-Za-z0-9_\-]+=[^;\s=]+)+"
+COOKIE_REMARK_TAG = "astrbot_cookie"  # 环境变量备注中的管理标记，用于识别本插件管理的变量
 
 
 class QinglongAPI:
@@ -229,6 +235,139 @@ class QinglongAPI:
         """获取系统信息"""
         success, data = await self._request("GET", "/open/system")
         return data if success and isinstance(data, dict) else None
+
+
+class JDSmsLogin:
+    """京东 H5 短信验证码登录辅助类
+    
+    公开流程（接口参数可能随京东风控策略调整，可在插件配置中校准）：
+    1. send_code:  发送短信验证码到手机号
+    2. check_code: 校验用户输入的验证码，换取登录 ticket
+    3. get_cookie: 用 ticket 换取 pt_key / pt_pin Cookie
+    """
+    
+    def __init__(self, config: dict):
+        self.config = config
+        self._client: Optional[httpx.AsyncClient] = None
+    
+    async def _get_client(self) -> httpx.AsyncClient:
+        """获取会话保持的 HTTP 客户端（登录流程需要携带 Cookie）"""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT, cookies=httpx.Cookies())
+        return self._client
+    
+    async def close(self):
+        """关闭 HTTP 客户端"""
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+            self._client = None
+    
+    def _base_headers(self) -> Dict[str, str]:
+        """登录接口基础请求头"""
+        return {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1",
+            "Referer": "https://plogin.m.jd.com/join/login?appid=20019",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+    
+    def _app_id(self) -> int:
+        return int(self.config.get("jd_sms_app_id", 20019))
+    
+    async def send_code(self, phone: str, uuid_str: str) -> Tuple[bool, str, Dict]:
+        """发送短信验证码，返回 (成功, 消息, 附加信息{smsKey, raw})"""
+        try:
+            client = await self._get_client()
+            url = self.config.get("jd_sms_send_url", "https://plogin.m.jd.com/cgi/ml/sendCode")
+            payload = {
+                "uuid": uuid_str,
+                "mobile": phone,
+                "appId": self._app_id(),
+                "smsKey": "",
+                "authcode": "",
+                "encode": "",
+            }
+            resp = await client.post(url, headers=self._base_headers(), json=payload)
+            data = resp.json()
+            
+            if data.get("code") == 0:
+                sms_key = ""
+                if isinstance(data.get("result"), dict):
+                    sms_key = data["result"].get("smsKey", "") or ""
+                return True, data.get("msg", "验证码已发送"), {"smsKey": sms_key, "raw": data}
+            
+            return False, data.get("msg", f"发送失败(code={data.get('code')})"), {"raw": data}
+        
+        except httpx.TimeoutException:
+            return False, "发送验证码请求超时", {}
+        except Exception as e:
+            return False, f"发送验证码请求异常: {e}", {}
+    
+    async def check_code(self, phone: str, code: str, uuid_str: str, sms_key: str = "") -> Tuple[bool, str, Dict]:
+        """校验短信验证码，换取 ticket，返回 (成功, 消息, 附加信息{ticket, raw})"""
+        try:
+            client = await self._get_client()
+            url = self.config.get("jd_sms_check_url", "https://plogin.m.jd.com/cgi/ml/checkCode")
+            payload = {
+                "code": code,
+                "uuid": uuid_str,
+                "appId": self._app_id(),
+                "sceneid": int(self.config.get("jd_sms_scene_id", 8)),
+                "smsKey": sms_key or "",
+            }
+            resp = await client.post(url, headers=self._base_headers(), json=payload)
+            data = resp.json()
+            
+            if data.get("code") == 0:
+                ticket = ""
+                if isinstance(data.get("result"), dict):
+                    ticket = data["result"].get("ticket", "") or ""
+                return True, data.get("msg", "校验成功"), {"ticket": ticket, "raw": data}
+            
+            return False, data.get("msg", f"校验失败(code={data.get('code')})"), {"raw": data}
+        
+        except httpx.TimeoutException:
+            return False, "校验验证码请求超时", {}
+        except Exception as e:
+            return False, f"校验验证码请求异常: {e}", {}
+    
+    async def get_cookie(self, ticket: str) -> Tuple[bool, str, Dict]:
+        """用 ticket 换取 Cookie，从 Set-Cookie 提取 pt_key / pt_pin，返回 (成功, 消息, 附加信息{cookie, raw})"""
+        try:
+            client = await self._get_client()
+            url = self.config.get("jd_sms_cookie_url", "https://plogin.m.jd.com/cgi/ml/getCookie")
+            resp = await client.get(f"{url}?ticket={ticket}", headers=self._base_headers())
+            
+            # 从 Set-Cookie 提取 pt_ 开头的键值对
+            set_cookies = resp.headers.get_list("set-cookie") if hasattr(resp.headers, "get_list") else []
+            pairs = []
+            for sc in set_cookies:
+                pair = sc.split(";")[0].strip() if sc else ""
+                if pair and "=" in pair:
+                    key = pair.split("=", 1)[0].strip()
+                    if key.startswith("pt_"):
+                        pairs.append(pair)
+            cookie_str = ";".join(pairs)
+            
+            if "pt_key=" in cookie_str and "pt_pin=" in cookie_str:
+                return True, "获取Cookie成功", {"cookie": cookie_str, "raw_set_cookie": set_cookies}
+            
+            # 部分版本返回 JSON 结果
+            try:
+                data = resp.json()
+                if isinstance(data, dict) and data.get("code") == 0 and isinstance(data.get("result"), dict):
+                    # 某些版本 result 中直接包含 cookie 字段
+                    direct = data["result"].get("cookie", "") or data["result"].get("ck", "")
+                    if direct and "pt_key=" in direct and "pt_pin=" in direct:
+                        return True, "获取Cookie成功", {"cookie": direct, "raw": data}
+                return False, data.get("msg", "未获取到完整Cookie（可能被风控拦截）"), {"cookie": cookie_str, "raw": data}
+            except Exception:
+                return False, "未获取到完整Cookie（可能被风控拦截，建议实机抓包校准接口）", {"cookie": cookie_str, "raw_set_cookie": set_cookies}
+        
+        except httpx.TimeoutException:
+            return False, "获取Cookie请求超时", {}
+        except Exception as e:
+            return False, f"获取Cookie请求异常: {e}", {}
 
 
 class TaskLogMonitor:
@@ -1100,6 +1239,41 @@ class QinglongPlugin(Star):
         if "log_error_display_lines" not in config:
             config["log_error_display_lines"] = 50
         
+        # Cookie 自动保存配置默认值
+        cookie_defaults = {
+            "cookie_auto_enabled": True,
+            "cookie_env_prefix": "JD_COOKIE",
+            "cookie_enabled_groups": [],
+            "cookie_match_regex": DEFAULT_COOKIE_REGEX,
+            "cookie_min_pairs": 2,
+            "cookie_reply_enabled": True,
+        }
+        for key, default in cookie_defaults.items():
+            if key not in config:
+                config[key] = default
+        # 确保列表类型配置
+        if not isinstance(config.get("cookie_enabled_groups"), list):
+            config["cookie_enabled_groups"] = []
+        
+        # 京东短信验证码登录配置默认值
+        sms_defaults = {
+            "sms_login_enabled": True,
+            "sms_enabled_groups": [],
+            "sms_cooldown_seconds": 60,
+            "sms_session_timeout": 300,
+            "sms_reply_enabled": True,
+            "jd_sms_app_id": 20019,
+            "jd_sms_scene_id": 8,
+            "jd_sms_send_url": "https://plogin.m.jd.com/cgi/ml/sendCode",
+            "jd_sms_check_url": "https://plogin.m.jd.com/cgi/ml/checkCode",
+            "jd_sms_cookie_url": "https://plogin.m.jd.com/cgi/ml/getCookie",
+        }
+        for key, default in sms_defaults.items():
+            if key not in config:
+                config[key] = default
+        if not isinstance(config.get("sms_enabled_groups"), list):
+            config["sms_enabled_groups"] = []
+        
         ql_host = config.get("qinglong_host", "http://localhost:5700")
         ql_client_id = config.get("qinglong_client_id", "")
         ql_client_secret = config.get("qinglong_client_secret", "")
@@ -1107,11 +1281,17 @@ class QinglongPlugin(Star):
         self.ql_api = QinglongAPI(ql_host, ql_client_id, ql_client_secret)
         self.log_monitor = TaskLogMonitor(self.ql_api, self, config)
         self.schedule_manager = LogScheduleManager(self, config)
+        self.jd_sms = JDSmsLogin(config)
         self.last_task_log = None
         self.log_check_task = None
         self.check_interval = 30
+        # 京东短信登录状态：uid -> {phone, uuid, sms_key, sent_at}
+        self.sms_sessions: Dict[str, Dict] = {}
+        self.sms_uid_cooldown: Dict[str, float] = {}    # uid -> 上次发码时间
+        self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
+        self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.3.3)")
+        logger.info("青龙面板插件已加载 (v1.4.0)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -1144,8 +1324,8 @@ class QinglongPlugin(Star):
                 fixed_list = []
                 for item in self.config[key]:
                     if item and str(item).strip():
-                        # 尝试格式化
-                        if "FriendMessage" in key:
+                        # 尝试格式化（键名以 friends 结尾的是好友配置）
+                        if key.endswith("friends"):
                             formatted = self.schedule_manager._format_target(item, "FriendMessage")
                         else:
                             formatted = self.schedule_manager._format_target(item, "GroupMessage")
@@ -1245,6 +1425,8 @@ class QinglongPlugin(Star):
             "pending": self._handle_pending_logs,
             "sendlog": self._handle_send_log,
             "schedule": self._handle_schedule,
+            "cookie": self._handle_cookie_cmd,
+            "sms": self._handle_sms_cmd,
         }
         
         handler = handlers.get(command)
@@ -1282,6 +1464,587 @@ class QinglongPlugin(Star):
                 
         except Exception as e:
             logger.error(f"处理错误日志确认时发生错误: {e}")
+    
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def handle_cookie_auto(self, event: AstrMessageEvent):
+        """自动识别群消息中的 Cookie 并保存/更新到青龙环境变量
+        
+        规则：
+        - 仅处理群消息（GroupMessage）
+        - 消息中需包含 key=value;key=value 形式的 Cookie 文本
+        - 每个用户保存为独立环境变量（前缀_昵称），备注中记录 uid 标记
+        - 同一用户再次发送时，自动更新其上次保存的变量，而不是新增
+        """
+        try:
+            # 功能开关
+            if not self.config.get("cookie_auto_enabled", True):
+                return
+            
+            # 仅处理群消息
+            if not self._is_group_message(event):
+                return
+            
+            # 跳过命令消息
+            message_str = (event.message_str or "").strip()
+            if not message_str or message_str.startswith("/"):
+                return
+            
+            # 群白名单（配置了才限制）
+            enabled_groups = self.config.get("cookie_enabled_groups", [])
+            if enabled_groups:
+                group_id = self._get_group_id(event)
+                if group_id is not None and str(group_id) not in [str(g).strip() for g in enabled_groups]:
+                    return
+            
+            # 提取 Cookie
+            cookie = self._extract_cookie(message_str)
+            if not cookie:
+                return
+            
+            user_id = self._get_sender_id(event)
+            nickname = self._get_sender_name(event)
+            group_id = self._get_group_id(event)
+            
+            logger.info(f"检测到Cookie: 用户={nickname or user_id} (uid={user_id}), 群={group_id}, 长度={len(cookie)}")
+            
+            success, is_update, env_name, error = await self._save_or_update_cookie(
+                user_id=user_id, nickname=nickname, group_id=group_id, cookie=cookie
+            )
+            
+            if not self.config.get("cookie_reply_enabled", True):
+                return
+            
+            masked = self._mask_cookie(cookie)
+            if success:
+                action = "🔄 已更新" if is_update else "✅ 已保存"
+                reply = (
+                    f"{action}你的Cookie\n"
+                    f"📛 环境变量: {env_name}\n"
+                    f"🔑 值: {masked}\n"
+                    f"⏰ 时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}"
+                )
+            else:
+                reply = f"❌ Cookie保存失败: {error}\n请检查青龙面板配置或稍后重试"
+            
+            await self.context.send_message(event.unified_msg_origin, MessageChain().message(reply))
+            
+        except Exception as e:
+            logger.error(f"自动保存Cookie时发生错误: {e}")
+            logger.error(traceback.format_exc())
+    
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def handle_sms_login(self, event: AstrMessageEvent):
+        """京东短信验证码登录：先发送"登录"触发，再发送手机号/验证码完成登录
+        
+        交互流程：
+        1. 群友发送「登录」→ 插件引导发送手机号
+        2. 群友发送手机号（11位，1开头）→ 插件调用京东发码接口下发短信验证码
+        3. 群友把收到的验证码（4-6位）发到群里 → 插件校验并换取 Cookie
+        4. 登录成功后自动保存/更新该用户的青龙环境变量
+        
+        安全约束（防短信轰炸）：
+        - 必须先发送「登录」触发流程，未触发时发手机号不动作
+        - 同一发送者限频（sms_cooldown_seconds）
+        - 同一手机号限频（sms_cooldown_seconds）
+        - 验证码回传必须由发起登录的同一用户发送
+        """
+        try:
+            if not self.config.get("sms_login_enabled", True):
+                return
+            if not self._is_group_message(event):
+                return
+            
+            message_str = (event.message_str or "").strip()
+            if not message_str:
+                return
+            
+            user_id = self._get_sender_id(event)
+            
+            # 群白名单（配置了才限制）
+            enabled_groups = self.config.get("sms_enabled_groups", [])
+            if enabled_groups:
+                group_id = self._get_group_id(event)
+                if group_id is not None and str(group_id) not in [str(g).strip() for g in enabled_groups]:
+                    return
+            
+            # 触发词"登录"：启动短信验证码登录流程
+            # 兼容 "/登录" "/登陆"（用户习惯用 / 唤醒机器人）
+            trigger_text = message_str[1:].strip() if message_str.startswith("/") else message_str
+            if trigger_text in ("登录", "登陆"):
+                await self._process_sms_start(event, user_id)
+                return
+            
+            # 其他命令消息跳过
+            if message_str.startswith("/"):
+                return
+            
+            # 提取消息中的纯数字部分
+            digits = re.sub(r'\D', '', message_str)
+            if not digits:
+                return
+            
+            # 手机号：11位且以1开头
+            if len(digits) == 11 and digits.startswith("1"):
+                await self._process_sms_phone(event, user_id, digits)
+                return
+            
+            # 验证码：4-6位纯数字
+            if 4 <= len(digits) <= 6:
+                await self._process_sms_code(event, user_id, digits)
+        
+        except Exception as e:
+            logger.error(f"处理短信登录消息时发生错误: {e}")
+            logger.error(traceback.format_exc())
+    
+    async def _process_sms_start(self, event: AstrMessageEvent, user_id: str):
+        """处理"登录"触发词：启动短信验证码登录流程"""
+        now = time.time()
+        self.sms_intents[user_id] = now
+        # 清理该用户可能存在的旧登录会话
+        self.sms_sessions.pop(user_id, None)
+        logger.info(f"用户 {user_id} 触发了京东短信登录流程")
+        await self._sms_reply(
+            event,
+            "📱 好的，开始京东短信验证码登录\n"
+            "请发送你的京东绑定手机号（11位数字）"
+        )
+    
+    async def _process_sms_phone(self, event: AstrMessageEvent, user_id: str, phone: str):
+        """处理用户发送的手机号：需先触发"登录"才允许发码"""
+        now = time.time()
+        
+        # 必须先发送"登录"触发流程，防止直接对任意手机号发码
+        intent_time = self.sms_intents.get(user_id, 0)
+        intent_timeout = int(self.config.get("sms_session_timeout", 300))
+        if now - intent_time > intent_timeout:
+            await self._sms_reply(
+                event,
+                "ℹ️ 如需京东登录，请先发送「登录」两个字开始流程"
+            )
+            return
+        
+        cooldown = int(self.config.get("sms_cooldown_seconds", 60))
+        
+        # 同一发送者限频
+        last_uid = self.sms_uid_cooldown.get(user_id, 0)
+        if now - last_uid < cooldown:
+            remain = int(cooldown - (now - last_uid))
+            await self._sms_reply(event, f"⏳ 发送过于频繁，请 {remain} 秒后再试")
+            return
+        
+        # 同一手机号限频（防短信轰炸）
+        last_phone = self.sms_phone_cooldown.get(phone, 0)
+        if now - last_phone < cooldown:
+            remain = int(cooldown - (now - last_phone))
+            await self._sms_reply(event, f"⏳ 该手机号发送过于频繁，请 {remain} 秒后再试")
+            return
+        
+        # 清理该用户可能存在的旧会话
+        self.sms_sessions.pop(user_id, None)
+        
+        uuid_str = str(uuid.uuid4())
+        ok, msg, info = await self.jd_sms.send_code(phone, uuid_str)
+        if not ok:
+            logger.warning(f"京东发码失败: 手机号={phone[:3]}****{phone[7:]}, 原因={msg}")
+            await self._sms_reply(
+                event,
+                f"❌ 验证码发送失败: {msg}\n可能是接口风控或参数变化，可稍后重试或联系管理员检查日志"
+            )
+            return
+        
+        sms_key = info.get("smsKey", "") or ""
+        self.sms_sessions[user_id] = {
+            "phone": phone,
+            "uuid": uuid_str,
+            "sms_key": sms_key,
+            "sent_at": now,
+        }
+        self.sms_uid_cooldown[user_id] = now
+        self.sms_phone_cooldown[phone] = now
+        self.sms_intents.pop(user_id, None)  # 已进入发码阶段，清除登录意图
+        
+        timeout_min = max(int(self.config.get("sms_session_timeout", 300)) // 60, 1)
+        masked_phone = phone[:3] + "****" + phone[7:]
+        logger.info(f"京东验证码已发送: 用户={user_id}, 手机号={masked_phone}")
+        await self._sms_reply(
+            event,
+            f"📱 验证码已发送至 {masked_phone}\n"
+            f"请将收到的验证码发到群里完成登录\n"
+            f"⏰ {timeout_min} 分钟内有效"
+        )
+    
+    async def _process_sms_code(self, event: AstrMessageEvent, user_id: str, code: str):
+        """处理用户发送的验证码：校验并换取 Cookie，更新青龙环境变量"""
+        session = self.sms_sessions.get(user_id)
+        if not session:
+            return  # 无进行中的登录流程，静默忽略
+        
+        now = time.time()
+        timeout = int(self.config.get("sms_session_timeout", 300))
+        if now - session["sent_at"] > timeout:
+            self.sms_sessions.pop(user_id, None)
+            await self._sms_reply(event, "⏰ 验证码已过期，请重新发送手机号获取验证码")
+            return
+        
+        phone = session["phone"]
+        ok, msg, info = await self.jd_sms.check_code(
+            phone, code, session["uuid"], session.get("sms_key", "")
+        )
+        if not ok:
+            logger.warning(f"京东验证码校验失败: 用户={user_id}, 原因={msg}")
+            await self._sms_reply(event, f"❌ 验证码校验失败: {msg}\n请检查验证码是否正确，或重新发送手机号获取新验证码")
+            return
+        
+        ticket = info.get("ticket", "")
+        if not ticket:
+            self.sms_sessions.pop(user_id, None)
+            await self._sms_reply(event, "❌ 未获取到登录凭证（ticket），请重新发送手机号重试")
+            return
+        
+        ok2, msg2, info2 = await self.jd_sms.get_cookie(ticket)
+        if not ok2:
+            self.sms_sessions.pop(user_id, None)
+            await self._sms_reply(
+                event,
+                f"❌ 获取Cookie失败: {msg2}\n可能被风控拦截，请稍后重试"
+            )
+            return
+        
+        cookie = info2.get("cookie", "")
+        if not cookie:
+            self.sms_sessions.pop(user_id, None)
+            await self._sms_reply(event, "❌ 获取到的Cookie为空，请重新发送手机号重试")
+            return
+        
+        # 复用 Cookie 保存/更新逻辑：按用户保存独立变量，同用户再登录自动更新
+        nickname = self._get_sender_name(event)
+        group_id = self._get_group_id(event)
+        success, is_update, env_name, error = await self._save_or_update_cookie(
+            user_id=user_id, nickname=nickname, group_id=group_id, cookie=cookie
+        )
+        self.sms_sessions.pop(user_id, None)
+        
+        masked_phone = phone[:3] + "****" + phone[7:]
+        if success:
+            action = "🔄 已更新" if is_update else "✅ 已保存"
+            masked = self._mask_cookie(cookie)
+            logger.info(f"京东短信登录成功: 用户={nickname or user_id}, 变量={env_name}")
+            pin = self._extract_pin(cookie)
+            pin_text = f"👤 京东账号: {pin}\n" if pin else ""
+            await self._sms_reply(
+                event,
+                f"{action}你的京东Cookie\n"
+                f"📛 环境变量: {env_name}\n"
+                f"🔑 值: {masked}\n"
+                f"{pin_text}"
+                f"📱 手机号: {masked_phone}"
+            )
+        else:
+            await self._sms_reply(event, f"❌ Cookie保存到青龙失败: {error}\n请检查青龙面板配置")
+    
+    async def _sms_reply(self, event: AstrMessageEvent, text: str):
+        """发送短信登录相关回复（受回复开关控制）"""
+        if self.config.get("sms_reply_enabled", True):
+            await self.context.send_message(event.unified_msg_origin, MessageChain().message(text))
+    
+    def _is_group_message(self, event: AstrMessageEvent) -> bool:
+        """判断消息是否为群消息"""
+        umo = event.unified_msg_origin or ""
+        return "GroupMessage" in umo
+    
+    def _get_sender_id(self, event: AstrMessageEvent) -> str:
+        """获取发送者ID"""
+        try:
+            return str(event.get_sender_id())
+        except Exception:
+            pass
+        try:
+            return str(event.message_obj.sender.user_id)
+        except Exception:
+            return "unknown"
+    
+    def _get_sender_name(self, event: AstrMessageEvent) -> str:
+        """获取发送者昵称"""
+        try:
+            name = event.get_sender_name()
+            if name:
+                return str(name).strip()
+        except Exception:
+            pass
+        try:
+            return str(event.message_obj.sender.nickname or "").strip()
+        except Exception:
+            return ""
+    
+    def _get_group_id(self, event: AstrMessageEvent) -> Optional[str]:
+        """获取群号"""
+        try:
+            if event.message_obj and event.message_obj.group_id:
+                return str(event.message_obj.group_id)
+        except Exception:
+            pass
+        umo = event.unified_msg_origin or ""
+        if "GroupMessage" in umo:
+            parts = umo.split(":")
+            if parts:
+                return parts[-1]
+        return None
+    
+    def _extract_cookie(self, text: str) -> Optional[str]:
+        """从消息文本中提取 Cookie，无法识别时返回 None"""
+        if not text:
+            return None
+        
+        regex = self.config.get("cookie_match_regex", DEFAULT_COOKIE_REGEX)
+        try:
+            match = re.search(regex, text)
+        except re.error:
+            logger.warning("Cookie匹配正则无效，使用默认正则")
+            match = re.search(DEFAULT_COOKIE_REGEX, text)
+        
+        if not match:
+            return None
+        
+        cookie = match.group(0).strip().strip(';').strip()
+        
+        # 校验键值对数量，防止误触发
+        min_pairs = max(int(self.config.get("cookie_min_pairs", 2)), 1)
+        pairs = [p for p in cookie.split(';') if '=' in p and p.split('=', 1)[1].strip()]
+        if len(pairs) < min_pairs:
+            return None
+        
+        return cookie
+    
+    def _mask_cookie(self, cookie: str) -> str:
+        """掩码 Cookie 值，避免在群内暴露完整凭证"""
+        parts = [p for p in cookie.split(';') if p.strip()]
+        masked = []
+        for p in parts:
+            if '=' in p:
+                k, v = p.split('=', 1)
+                v = v.strip()
+                if not v:
+                    masked.append(f"{k}=****")
+                elif len(v) <= 4:
+                    masked.append(f"{k}={v[0]}****")
+                else:
+                    masked.append(f"{k}={v[:4]}***({len(v)}位)")
+            else:
+                masked.append(p.strip())
+        return ';'.join(masked)
+    
+    def _extract_pin(self, cookie: str) -> str:
+        """从 Cookie 中提取京东账号标识 pt_pin，用于区分同一用户的多个账号"""
+        if not cookie:
+            return ""
+        for part in cookie.split(';'):
+            part = part.strip()
+            if part.lower().startswith('pt_pin='):
+                return part.split('=', 1)[1].strip()
+        return ""
+    
+    def _build_cookie_remark(self, user_id: str, group_id: Optional[str], pin: str = "") -> str:
+        """构建 Cookie 环境变量的备注信息（uid 标识发送者，pin 标识京东账号）"""
+        now_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+        remark = f"AstrBot自动Cookie | {COOKIE_REMARK_TAG} | uid:{user_id}"
+        if pin:
+            remark += f" | pin:{pin}"
+        if group_id:
+            remark += f" | group:{group_id}"
+        remark += f" | 更新:{now_str}"
+        return remark
+    
+    async def _find_user_cookie_env(self, user_id: str, prefix: str, pin: str = "") -> Optional[Dict]:
+        """查找用户已保存的 Cookie 环境变量
+        
+        匹配规则（同一用户可拥有多个京东账号）：
+        - 先按 uid + pin 精确匹配（再次登录同一账号时更新原变量）
+        - 若 pin 为空或未匹配到：该用户仅有 1 个无 pin 标记的旧版变量时，视为同一账号更新并补 pin
+        - 该用户已有多个变量但当前 pin 不匹配：返回 None，走新建逻辑
+        """
+        envs = await self.ql_api.get_envs("")
+        uid_tag = f"uid:{user_id}"
+        candidates = []
+        for env in envs:
+            name = env.get('name', '') or ''
+            remarks = env.get('remarks', '') or ''
+            if name.startswith(prefix) and COOKIE_REMARK_TAG in remarks and uid_tag in remarks:
+                candidates.append(env)
+        
+        if not candidates:
+            return None
+        
+        if pin:
+            pin_tag = f"pin:{pin}"
+            for env in candidates:
+                if pin_tag in (env.get('remarks', '') or ''):
+                    return env
+            # 兼容升级前的旧变量：该用户只有 1 个变量且备注无 pin -> 视为同一账号
+            old_vars = [e for e in candidates if 'pin:' not in (e.get('remarks', '') or '')]
+            if len(candidates) == 1 and old_vars:
+                return old_vars[0]
+            return None
+        
+        # 无 pin 信息（如非京东 Cookie）：仅该用户 1 个变量时更新它
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+    
+    async def _save_or_update_cookie(
+        self, user_id: str, nickname: str, group_id: Optional[str], cookie: str
+    ) -> Tuple[bool, bool, str, str]:
+        """保存或更新用户的 Cookie
+        
+        同一用户可挂多个京东账号：按 pt_pin 区分，同一账号再次登录更新原变量，
+        不同账号各自新建独立变量。
+        返回: (是否成功, 是否更新而非新增, 环境变量名, 错误信息)
+        """
+        prefix = str(self.config.get("cookie_env_prefix", "JD_COOKIE")).strip() or "JD_COOKIE"
+        pin = self._extract_pin(cookie)
+        
+        # 构建环境变量名：前缀_昵称（清理非法字符，避免超长）
+        display_name = nickname or user_id
+        clean_name = re.sub(r'[^\w\u4e00-\u9fa5]', '_', display_name)[:20]
+        env_name = f"{prefix}_{clean_name}"
+        remark = self._build_cookie_remark(user_id, group_id, pin)
+        
+        # 按 uid + pin 查找该用户的该账号 -> 更新（同一账号再次登录时走这里）
+        existing = await self._find_user_cookie_env(user_id, prefix, pin)
+        if existing:
+            env_name = existing.get('name', env_name)
+            success, msg = await self.ql_api.update_env(
+                existing.get('id'), env_name, cookie, remark
+            )
+            if success:
+                logger.info(f"已更新用户 {nickname or user_id} 的Cookie变量: {env_name} (pin={pin or '未知'})")
+                return True, True, env_name, ""
+            return False, True, env_name, msg
+        
+        # 名称冲突处理：同名已被他人占用时追加序号
+        all_envs = await self.ql_api.get_envs("")
+        used_names = set(e.get('name', '') for e in all_envs)
+        base_name = env_name
+        suffix = 2
+        while env_name in used_names:
+            env_name = f"{base_name}_{suffix}"
+            suffix += 1
+        
+        success, msg = await self.ql_api.add_env(env_name, cookie, remark)
+        if success:
+            logger.info(f"已保存用户 {nickname or user_id} 的Cookie变量: {env_name} (pin={pin or '未知'})")
+            return True, False, env_name, ""
+        return False, False, env_name, msg
+    
+    async def _handle_cookie_cmd(self, event: AstrMessageEvent, parts: list):
+        """处理 Cookie 自动保存相关命令"""
+        if len(parts) < 3:
+            yield event.plain_result(
+                "🍪 Cookie自动保存功能:\n"
+                "/ql cookie status - 查看状态\n"
+                "/ql cookie list - 查看已保存的Cookie变量\n"
+                "/ql cookie enable - 启用自动保存\n"
+                "/ql cookie disable - 禁用自动保存"
+            )
+            return
+        
+        subcommand = parts[2].lower()
+        
+        if subcommand == "status":
+            enabled = self.config.get("cookie_auto_enabled", True)
+            prefix = self.config.get("cookie_env_prefix", "JD_COOKIE")
+            groups = self.config.get("cookie_enabled_groups", [])
+            reply = (
+                f"🍪 Cookie自动保存状态:\n"
+                f"状态: {'🟢 已启用' if enabled else '🔴 已禁用'}\n"
+                f"变量前缀: {prefix}\n"
+                f"保存方式: 每人可挂多个账号，同一账号再发自动更新\n"
+                f"允许的群: {', '.join(str(g) for g in groups) if groups else '全部群'}"
+            )
+            yield event.plain_result(reply)
+        
+        elif subcommand == "list":
+            prefix = str(self.config.get("cookie_env_prefix", "JD_COOKIE")).strip() or "JD_COOKIE"
+            envs = await self.ql_api.get_envs("")
+            cookie_envs = [
+                e for e in envs
+                if (e.get('name', '') or '').startswith(prefix)
+                and COOKIE_REMARK_TAG in (e.get('remarks', '') or '')
+            ]
+            if not cookie_envs:
+                yield event.plain_result("🍪 暂无已保存的Cookie变量")
+                return
+            
+            result = f"🍪 已保存的Cookie变量 (共 {len(cookie_envs)} 个):\n\n"
+            for env in cookie_envs:
+                value = self._mask_cookie(env.get('value', '') or '')
+                remarks = env.get('remarks', '') or ''
+                pin = ""
+                for field in remarks.split("|"):
+                    field = field.strip()
+                    if field.startswith("pin:"):
+                        pin = field[4:]
+                        break
+                pin_text = f"  👤 京东账号: {pin}\n" if pin else ""
+                result += f"📛 {env.get('name')}\n"
+                result += f"  ID: {env.get('id')}\n"
+                result += f"  值: {value}\n"
+                result += pin_text
+                result += f"  备注: {remarks}\n\n"
+            yield event.plain_result(result)
+        
+        elif subcommand == "enable":
+            self.config["cookie_auto_enabled"] = True
+            yield event.plain_result("✅ 已启用Cookie自动保存\n用户在群内发送Cookie后将自动保存到青龙环境变量")
+        
+        elif subcommand == "disable":
+            self.config["cookie_auto_enabled"] = False
+            yield event.plain_result("✅ 已禁用Cookie自动保存")
+        
+        else:
+            yield event.plain_result(f"❌ 未知的Cookie子命令: {subcommand}")
+    
+    async def _handle_sms_cmd(self, event: AstrMessageEvent, parts: list):
+        """处理京东短信验证码登录相关命令"""
+        if len(parts) < 3:
+            yield event.plain_result(
+                "📱 京东短信验证码登录:\n"
+                "/ql sms status - 查看状态\n"
+                "/ql sms enable - 启用\n"
+                "/ql sms disable - 禁用\n\n"
+                "使用方式：\n"
+                "1. 在群里发送「登录」两个字开始流程\n"
+                "2. 按提示发送手机号，如 13800138000\n"
+                "3. 收到短信后，把验证码发到群里（如 123456）\n"
+                "4. 登录成功后自动保存/更新你的京东Cookie\n\n"
+                "⚠️ 同一手机号/用户有限频，防止被滥用"
+            )
+            return
+        
+        subcommand = parts[2].lower()
+        
+        if subcommand == "status":
+            enabled = self.config.get("sms_login_enabled", True)
+            groups = self.config.get("sms_enabled_groups", [])
+            cooldown = self.config.get("sms_cooldown_seconds", 60)
+            active = len(self.sms_sessions)
+            yield event.plain_result(
+                f"📱 京东短信登录状态:\n"
+                f"状态: {'🟢 已启用' if enabled else '🔴 已禁用'}\n"
+                f"允许的群: {', '.join(str(g) for g in groups) if groups else '全部群'}\n"
+                f"发码间隔: {cooldown} 秒\n"
+                f"进行中的登录: {active} 个"
+            )
+        
+        elif subcommand == "enable":
+            self.config["sms_login_enabled"] = True
+            yield event.plain_result("✅ 已启用京东短信验证码登录\n群友发送手机号即可开始")
+        
+        elif subcommand == "disable":
+            self.config["sms_login_enabled"] = False
+            yield event.plain_result("✅ 已禁用京东短信验证码登录")
+        
+        else:
+            yield event.plain_result(f"❌ 未知的短信登录子命令: {subcommand}")
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
@@ -1330,7 +2093,19 @@ class QinglongPlugin(Star):
 /ql schedule time <时间> - 设置推送时间，如 08:00,18:00
 
 📊 系统信息:
-/ql info - 查看系统信息"""
+/ql info - 查看系统信息
+
+🍪 Cookie自动保存:
+群内直接发送 Cookie（如 pt_key=xxx;pt_pin=xxx）自动保存到青龙环境变量，
+同一账号再次发送自动更新；同一人可挂多个账号，互不覆盖
+/ql cookie status - 查看状态
+/ql cookie list - 查看已保存的Cookie变量（含京东账号）
+/ql cookie enable/disable - 启用/禁用
+
+📱 京东短信登录:
+群里发送「登录」→按提示发手机号→把验证码发到群里，自动登录并更新你的Cookie
+/ql sms status - 查看状态
+/ql sms enable/disable - 启用/禁用"""
         yield event.plain_result(help_text)
     
     async def _handle_last_log(self, event: AstrMessageEvent, parts: list):
@@ -1986,5 +2761,6 @@ class QinglongPlugin(Star):
         if self.log_check_task and not self.log_check_task.done():
             self.log_check_task.cancel()
         
+        await self.jd_sms.close()
         await self.ql_api.close()
         logger.info("青龙面板插件已卸载")
