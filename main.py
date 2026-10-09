@@ -715,7 +715,7 @@ class BrowserLoginHelper:
                 for item in obj:
                     if isinstance(item, (list, tuple)) and len(item) >= 2:
                         pts.append((int(item[0]), int(item[1])))
-                return pts if len(pts) >= 2 else None
+                return pts if len(pts) >= 1 else None
         except Exception:
             pass
         # 分隔符形式 "x1,y1;x2,y2;..." 或 "x1,y1|x2,y2" 或空格
@@ -730,7 +730,7 @@ class BrowserLoginHelper:
                     except Exception:
                         ok = False
                         break
-                if ok and len(pts) >= 2:
+                if ok and len(pts) >= 1:
                     return pts
                 pts = []
         return None
@@ -741,15 +741,15 @@ class BrowserLoginHelper:
         await page.mouse.move(start_x, start_y)
         await page.mouse.down()
         await asyncio.sleep(0.1)
-        distance = max(distance, 1)
-        steps = max(int(distance / 3), 6)
+        total = distance  # 可为负（向左拖）
+        steps = max(int(abs(total) / 3), 6)
         # 前 60% 走完 80% 距离（快），后 40% 走完 20%（慢，对齐）
         fast_end = int(steps * 0.6)
         for i in range(1, steps + 1):
             if i <= fast_end:
-                x = start_x + distance * (0.8 * i / fast_end)
+                x = start_x + total * (0.8 * i / fast_end)
             else:
-                x = start_x + distance * (0.8 + 0.2 * (i - fast_end) / (steps - fast_end))
+                x = start_x + total * (0.8 + 0.2 * (i - fast_end) / (steps - fast_end))
             y = start_y + random.uniform(-y_jitter, y_jitter)
             await page.mouse.move(x, y, steps=2)
             await asyncio.sleep(random.uniform(0.012, 0.035))
@@ -771,6 +771,24 @@ class BrowserLoginHelper:
             except Exception:
                 continue
         return ""
+
+    @staticmethod
+    def _parse_transform_angle(txt: str) -> Optional[float]:
+        """从 transform 文本解析旋转角度（支持 rotate(Xdeg) 与 matrix）"""
+        if not txt:
+            return None
+        try:
+            import re as _re
+            m = _re.search(r"rotate\(\s*(-?[\d.]+)deg", txt)
+            if m:
+                return float(m.group(1))
+            m = _re.search(r"matrix\(([-\d.]+),\s*([-\d.]+)", txt)
+            if m:
+                import math as _math
+                return _math.degrees(_math.atan2(float(m.group(2)), float(m.group(1))))
+        except Exception:
+            pass
+        return None
 
     async def _solve_rotate(self, page) -> Tuple[bool, str]:
         """破解旋转摆正题：打码识别角度 → 拖动"""
@@ -842,16 +860,31 @@ class BrowserLoginHelper:
             logger.info(f"旋转题自检: 拖动后图片transform={rot_after}")
         except Exception:
             logger.info("旋转题自检: 无法读取拖动后 transform")
-        # 同题微调：弹窗未消失则按 ±30°/±60° 偏移重拖（同一验证码，不重新打码）
-        for off_deg in (30, -30, 60, -60):
-            if await self._wait_captcha_gone(page, timeout_s=2.5):
+        # 图片转正后静候京东校验（不微调破坏正确状态），轮询最长 8 秒
+        for _ in range(4):
+            if await self._wait_captcha_gone(page, timeout_s=2.0):
                 return True, f"已按 {angle}° 拖动"
+        cur_txt = await self._get_rotate_transform(page)
+        cur = self._parse_transform_angle(cur_txt)
+        logger.info(f"旋转题: 等待校验后图片角度={cur}° (transform={cur_txt})")
+        if cur is not None and abs(cur) <= 12:
+            # 图片已转正但弹窗仍在：轨迹风控/校验延迟，不冒险微调
+            return True, f"已按 {angle}° 拖动（图片已转正，等待校验）"
+        # 图片未转正：基于当前实际角度归零，再 ±30/±60 探测（双向拖动）
+        base = cur if cur is not None else angle_norm
+        for label, target_delta in (("归零", -base), ("+30", -base + 30), ("-30", -base - 30), ("+60", -base + 60), ("-60", -base - 60)):
+            if await self._wait_captcha_gone(page, timeout_s=2.0):
+                return True, f"已按 {angle}° 拖动（微调 {label}）"
             nb = await slide.bounding_box()
             if not nb:
                 break
-            d2 = abs(((angle_norm + off_deg + 180) % 360) - 180) / 360 * travel
-            logger.info(f"旋转题同题微调: 偏移 {off_deg:+d}° -> 距离 {int(d2)}px")
+            d2 = ((target_delta + 180) % 360 - 180) / 360 * travel
+            logger.info(f"旋转题同题微调: {label} (目标角度 {target_delta:+.0f}°) -> 拖动 {int(d2)}px")
             await self._drag_human(page, nb["x"] + nb["width"] / 2, nb["y"] + nb["height"] / 2, d2)
+            cur_txt = await self._get_rotate_transform(page)
+            base = self._parse_transform_angle(cur_txt)
+            if base is None:
+                base = target_delta
         return True, f"已按 {angle}° 拖动（含微调）"
 
     async def _solve_track(self, page) -> Tuple[bool, str]:
@@ -2272,7 +2305,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.22)")
+        logger.info("青龙面板插件已加载 (v1.5.23)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -3098,7 +3131,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.22
+        help_text = """📦 青龙面板管理插件 v1.5.23
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
