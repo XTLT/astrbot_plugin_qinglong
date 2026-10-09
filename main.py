@@ -591,28 +591,28 @@ class BrowserLoginHelper:
     # ------------------------------------------------------------------
     # 验证码题型识别与破解
     # ------------------------------------------------------------------
-    def _detect_type(self, page) -> str:
+    async def _detect_type(self, page) -> str:
         """检测当前验证码题型：rotate(旋转摆正) / track(轨迹绘制) / gap(缺口拼图) / unknown"""
         try:
-            has_slider = page.query_selector(".captcha_drop #slider-div") is not None
-            if has_slider:
+            has_slider = await page.query_selector(".captcha_drop #slider-div")
+            if has_slider is not None:
                 return "rotate"
-            text = page.evaluate("""() => {
+            text = await page.evaluate("""() => {
                 const d = document.querySelector('.captcha_drop');
                 return d ? (d.innerText || '') : '';
             }""")
             if "轨迹" in text or "绘制" in text:
                 return "track"
-            if page.query_selector(".captcha_drop canvas") is not None:
+            if await page.query_selector(".captcha_drop canvas") is not None:
                 return "gap"
             return "unknown"
         except Exception:
             return "unknown"
 
-    def _extract_image_b64(self, page) -> Optional[str]:
+    async def _extract_image_b64(self, page) -> Optional[str]:
         """提取验证码弹窗中的主图 base64（去掉 data: 前缀）"""
         try:
-            src = page.evaluate("""() => {
+            src = await page.evaluate("""() => {
                 const d = document.querySelector('.captcha_drop .slot-content img');
                 return d ? d.src : '';
             }""")
@@ -681,7 +681,7 @@ class BrowserLoginHelper:
 
     async def _solve_rotate(self, page) -> Tuple[bool, str]:
         """破解旋转摆正题：打码识别角度 → 拖动"""
-        img_b64 = self._extract_image_b64(page)
+        img_b64 = await self._extract_image_b64(page)
         if not img_b64:
             return False, "未获取到旋转图片"
         ok, result = await self._ttshitu(img_b64, str(self.config.get("jd_captcha_rotate_typeid", "29")))
@@ -696,10 +696,10 @@ class BrowserLoginHelper:
         distance = (angle % 360) * px_per_deg * direction
         if distance < 0:
             distance = 360 * px_per_deg + distance  # 负方向换算为正方向拖动
-        slide = page.query_selector("#slider-div")
+        slide = await page.query_selector("#slider-div")
         if not slide:
             return False, "未找到滑块按钮"
-        box = slide.bounding_box()
+        box = await slide.bounding_box()
         if not box:
             return False, "滑块位置不可用"
         logger.info(f"旋转题: 识别角度={angle}°, 拖动距离={int(distance)}px")
@@ -708,7 +708,7 @@ class BrowserLoginHelper:
 
     async def _solve_track(self, page) -> Tuple[bool, str]:
         """破解轨迹绘制题：打码识别轨迹坐标 → 在图上绘制"""
-        img_b64 = self._extract_image_b64(page)
+        img_b64 = await self._extract_image_b64(page)
         if not img_b64:
             return False, "未获取到轨迹图"
         ok, result = await self._ttshitu(img_b64, str(self.config.get("jd_captcha_track_typeid", "48")))
@@ -718,7 +718,7 @@ class BrowserLoginHelper:
         if not pts:
             return False, f"轨迹坐标解析失败: {result[:60]}"
         # 图片在 slot-content 内，需要相对页面的绝对坐标
-        img_box = page.evaluate("""() => {
+        img_box = await page.evaluate("""() => {
             const el = document.querySelector('.captcha_drop .slot-content img');
             if (!el) return null;
             const r = el.getBoundingClientRect();
@@ -747,7 +747,7 @@ class BrowserLoginHelper:
 
     async def _solve_gap(self, page) -> Tuple[bool, str]:
         """破解缺口拼图题：图鉴单缺口识别（typeid 33）返回 X 坐标 → 拖动"""
-        img_b64 = self._extract_image_b64(page)
+        img_b64 = await self._extract_image_b64(page)
         if not img_b64:
             return False, "未获取到缺口图"
         ok, result = await self._ttshitu(img_b64, str(self.config.get("jd_captcha_gap_typeid", "33")))
@@ -756,15 +756,15 @@ class BrowserLoginHelper:
         x = self._parse_angle(result)
         if x is None:
             return False, f"缺口坐标异常: {result}"
-        slide = page.query_selector("#slider-div")
+        slide = await page.query_selector("#slider-div")
         if not slide:
             return False, "未找到滑块按钮"
-        box = slide.bounding_box()
+        box = await slide.bounding_box()
         if not box:
             return False, "滑块位置不可用"
         # 缺口 X 坐标需减去滑块按钮宽度，并乘图片缩放比例
         scale = 1.0
-        img_box = page.evaluate("""() => {
+        img_box = await page.evaluate("""() => {
             const el = document.querySelector('.captcha_drop .slot-content img');
             if (!el) return null;
             const r = el.getBoundingClientRect();
@@ -790,7 +790,7 @@ class BrowserLoginHelper:
         deadline = time.time() + timeout_s
         while time.time() < deadline:
             try:
-                if page.query_selector(".captcha_drop") is None:
+                if await page.query_selector(".captcha_drop") is None:
                     return True
             except Exception:
                 pass
@@ -802,14 +802,14 @@ class BrowserLoginHelper:
         deadline = time.time() + timeout_s
         while time.time() < deadline:
             try:
-                btn = page.query_selector("#send-sms-code-btn")
+                btn = await page.query_selector("#send-sms-code-btn")
                 if btn:
-                    txt = btn.inner_text().strip()
-                    disabled = btn.is_disabled()
+                    txt = await btn.inner_text()
+                    disabled = await btn.is_disabled()
                     if disabled and any(k in txt for k in ("s", "秒", "重新")):
                         return True, f"验证码已发送（{txt}）"
                 # 或页面出现发送成功提示
-                body = page.evaluate("() => document.body.innerText || ''")
+                body = await page.evaluate("() => document.body.innerText || ''")
                 if "验证码已发送" in body or "发送成功" in body:
                     return True, "验证码已发送"
             except Exception:
@@ -850,7 +850,7 @@ class BrowserLoginHelper:
                 await page.evaluate("""() => { document.querySelector('#sms-login').click(); }""")
                 await asyncio.sleep(1.5)
                 # 输入手机号
-                mb = page.query_selector("#mobile-number")
+                mb = await page.query_selector("#mobile-number")
                 if not mb:
                     await context.close()
                     return False, "登录页未加载完整（短信表单未出现），请稍后重试"
@@ -862,7 +862,7 @@ class BrowserLoginHelper:
                 # 等待验证码弹窗
                 appeared = False
                 for _ in range(30):
-                    if page.query_selector(".captcha_drop"):
+                    if await page.query_selector(".captcha_drop"):
                         appeared = True
                         break
                     await asyncio.sleep(0.5)
@@ -879,9 +879,10 @@ class BrowserLoginHelper:
                 # 破解验证码（重试循环）
                 max_retry = max(int(self.config.get("jd_browser_max_retry", 4)), 1)
                 last_err = "验证码破解失败"
+                gone = False
                 for attempt in range(max_retry):
                     await asyncio.sleep(2)  # 等验证码内容加载
-                    ctype = self._detect_type(page)
+                    ctype = await self._detect_type(page)
                     logger.info(f"验证码破解尝试 {attempt+1}/{max_retry}: 题型={ctype}")
                     if ctype == "rotate":
                         ok, last_err = await self._solve_rotate(page)
@@ -930,7 +931,7 @@ class BrowserLoginHelper:
         page = session["page"]
         context = session["context"]
         try:
-            code_input = page.query_selector("#sms-code")
+            code_input = await page.query_selector("#sms-code")
             if not code_input:
                 return False, "验证码输入框不可用", ""
             await code_input.click(force=True)
@@ -1952,7 +1953,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.6)")
+        logger.info("青龙面板插件已加载 (v1.5.7)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -2778,7 +2779,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.6
+        help_text = """📦 青龙面板管理插件 v1.5.7
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
