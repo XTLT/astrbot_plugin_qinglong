@@ -901,14 +901,19 @@ class BrowserLoginHelper:
         start_center = mbox["x"] + mbox["width"] / 2
         # 对齐口径：箭头左边缘对准缺口目标 X（滑块类验证码常规口径），拖动从箭头中心按下
         distance = target_x - mbox["x"]
-        logger.info(f"箭头拼图题: 识别目标X={x}, 箭头左边缘={int(mbox['x'])}, 目标视口x={int(target_x)}, 拖动距离={int(distance)}px")
+        # 京东防"完美重合"：故意偏离 2~6px（人手不可能 100% 对齐，精确对齐反被判机器）
+        import random as _rr
+        imperfect = _rr.choice((-1, 1)) * _rr.uniform(2.5, 6.0)
+        distance += imperfect
+        logger.info(f"箭头拼图题: 识别目标X={x}, 箭头左边缘={int(mbox['x'])}, 目标视口x={int(target_x)}, 拖动距离={int(distance)}px(含偏差{imperfect:+.1f})")
         await self._drag_human(page, start_center, mbox["y"] + mbox["height"] / 2, distance)
         # 同题微调：弹窗未消失则按偏移重拖（同一验证码，不重新打码，省点数）
         for off in (40, -40, 80, -80):
             if await self._wait_captcha_gone(page, timeout_s=2.5):
                 return True, f"已按目标 X={x} 拖动箭头"
+            d2 = distance + off + _rr.choice((-1, 1)) * _rr.uniform(2.0, 5.0)
             logger.info(f"箭头拼图同题微调: 偏移 {off:+d}px")
-            await self._drag_human(page, start_center, mbox["y"] + mbox["height"] / 2, distance + off)
+            await self._drag_human(page, start_center, mbox["y"] + mbox["height"] / 2, d2)
         return True, f"已按目标 X={x} 拖动箭头（含微调）"
 
     async def _refresh_captcha(self, page):
@@ -976,6 +981,13 @@ class BrowserLoginHelper:
                 locale="zh-CN",
                 viewport={"width": 1280, "height": 900},
             )
+            # 隐藏自动化特征，降低被京东风控多维识别（webdriver/插件/languages）的概率
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                window.chrome = window.chrome || { runtime: {} };
+                Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh'] });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            """)
             page = await context.new_page()
             try:
                 await page.goto(self.JD_LOGIN_URL, timeout=60000, wait_until="domcontentloaded")
@@ -2099,7 +2111,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.13)")
+        logger.info("青龙面板插件已加载 (v1.5.14)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -2925,7 +2937,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.13
+        help_text = """📦 青龙面板管理插件 v1.5.14
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
