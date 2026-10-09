@@ -656,14 +656,15 @@ class BrowserLoginHelper:
             return "unknown"
 
     async def _extract_image_b64(self, page) -> Optional[str]:
-        """提取验证码弹窗中的主图 base64（去掉 data: 前缀），支持 iframe"""
+        """提取验证码弹窗中的主图 base64（去掉 data: 前缀），支持 iframe。
+        优先 #cpc_img（轨迹题参考图）→ .slot-content img（旋转/缺口题）→ 弹窗内任意 img"""
         try:
             for frame in page.frames:
                 try:
                     src = await frame.evaluate("""() => {
                         const d = document.querySelector('.captcha_drop');
                         if (!d) return '';
-                        const img = d.querySelector('.slot-content img') || d.querySelector('img');
+                        const img = d.querySelector('#cpc_img') || d.querySelector('.slot-content img') || d.querySelector('img');
                         return img ? img.src : '';
                     }""")
                     if src and "," in src:
@@ -759,7 +760,7 @@ class BrowserLoginHelper:
         return True, f"已按 {angle}° 拖动"
 
     async def _solve_track(self, page) -> Tuple[bool, str]:
-        """破解轨迹绘制题：打码识别轨迹坐标 → 在图上绘制"""
+        """破解轨迹绘制题：打码识别轨迹坐标 → 在 #trackLine 画布上按 #cpc_img 轨迹绘制"""
         img_b64 = await self._extract_image_b64(page)
         if not img_b64:
             return False, "未获取到轨迹图"
@@ -769,21 +770,30 @@ class BrowserLoginHelper:
         pts = self._parse_track_points(result)
         if not pts:
             return False, f"轨迹坐标解析失败: {result[:60]}"
-        # 图片在 slot-content 内，需要相对页面的绝对坐标（支持 iframe）
+        # 绘制画布 #trackLine 与参考图 #cpc_img（支持 iframe）
+        canvas_box = None
         img_box = None
         for frame in page.frames:
             try:
-                img_box = await frame.evaluate("""() => {
-                    const el = document.querySelector('.captcha_drop .slot-content img');
-                    if (!el) return null;
-                    const r = el.getBoundingClientRect();
-                    return {x: r.x, y: r.y, w: r.width, h: r.height, nw: el.naturalWidth, nh: el.naturalHeight};
+                boxes = await frame.evaluate("""() => {
+                    const c = document.querySelector('.captcha_drop #trackLine');
+                    const i = document.querySelector('.captcha_drop #cpc_img');
+                    const r = (el) => { const b = el.getBoundingClientRect(); return {x: b.x, y: b.y, w: b.width, h: b.height}; };
+                    return {
+                        c: c ? r(c) : null,
+                        i: i ? {...r(i), nw: i.naturalWidth, nh: i.naturalHeight} : null
+                    };
                 }""")
-                if img_box:
+                if boxes and (boxes.get("c") or boxes.get("i")):
+                    canvas_box = boxes.get("c") or boxes.get("i")
+                    img_box = boxes.get("i") or boxes.get("c")
+                    if img_box and not img_box.get("nw"):
+                        img_box["nw"] = img_box["w"]
+                        img_box["nh"] = img_box["h"]
                     break
             except Exception:
                 continue
-        if not img_box:
+        if not canvas_box or not img_box:
             return False, "未找到轨迹图位置"
         scale_x = img_box["w"] / max(img_box["nw"], 1)
         scale_y = img_box["h"] / max(img_box["nh"], 1)
@@ -791,8 +801,8 @@ class BrowserLoginHelper:
         # 起点按下，逐点移动，终点松开
         first = True
         for (px, py) in pts:
-            abs_x = img_box["x"] + px * scale_x
-            abs_y = img_box["y"] + py * scale_y
+            abs_x = canvas_box["x"] + px * scale_x
+            abs_y = canvas_box["y"] + py * scale_y
             if first:
                 await page.mouse.move(abs_x, abs_y)
                 await page.mouse.down()
@@ -2112,7 +2122,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.15)")
+        logger.info("青龙面板插件已加载 (v1.5.16)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -2938,7 +2948,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.15
+        help_text = """📦 青龙面板管理插件 v1.5.16
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
