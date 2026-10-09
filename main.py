@@ -402,7 +402,28 @@ class BrowserLoginHelper:
     # 浏览器安装与启动
     # ------------------------------------------------------------------
     def _chromium_executable(self) -> Optional[str]:
-        """返回 Playwright 管理的 Chromium 可执行文件路径（未安装则为 None）"""
+        """返回 Chromium 可执行文件路径（未安装则为 None）。
+        新版 Playwright 会校验浏览器安装完整性（INSTALLATION_COMPLETE + .links 哈希），
+        手动解压的浏览器过不了校验；因此优先直接 glob 查找可执行文件，绕过校验。"""
+        import glob, os
+        # 1. 自定义 / 自动探测目录中直接查找 chrome 可执行文件
+        roots = []
+        bpath = (self.config.get("jd_browser_path") or "").strip()
+        if bpath:
+            roots.append(bpath)
+        detected = self._find_existing_browser_path()
+        if detected:
+            roots.append(detected)
+        for root in roots:
+            if not root:
+                continue
+            try:
+                hits = glob.glob(os.path.join(root, "chromium-*", "chrome-linux64", "chrome"))
+                if hits:
+                    return hits[0]
+            except Exception:
+                continue
+        # 2. 退回 Playwright 标准安装（registry 校验通过的情况）
         try:
             from playwright.sync_api import sync_playwright
             with sync_playwright() as p:
@@ -515,6 +536,7 @@ class BrowserLoginHelper:
                 self._pw = await async_playwright().start()
                 self._browser = await self._pw.chromium.launch(
                     headless=bool(self.config.get("jd_browser_headless", True)),
+                    executable_path=exe,
                     args=["--disable-blink-features=AutomationControlled"],
                 )
                 return True, "ok"
@@ -1930,7 +1952,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.5)")
+        logger.info("青龙面板插件已加载 (v1.5.6)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -2756,7 +2778,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.5
+        help_text = """📦 青龙面板管理插件 v1.5.6
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
