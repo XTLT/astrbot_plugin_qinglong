@@ -638,6 +638,7 @@ class BrowserLoginHelper:
             for frame in page.frames:
                 try:
                     info = await self._eval_captcha(frame, """{
+                        const all = Array.from(document.querySelectorAll('.captcha_drop')).map(el => { const r = el.getBoundingClientRect(); return {w: Math.round(r.width), h: Math.round(r.height), vis: r.width > 50 && r.height > 50}; });
                         const cls = (typeof d.className === 'string') ? d.className : ((d.className && d.className.baseVal) || '');
                         const kids = Array.from(d.querySelectorAll('*')).map(e => {
                             let cn = '';
@@ -649,6 +650,7 @@ class BrowserLoginHelper:
                     if info:
                         logger.info(
                             f"验证码弹窗诊断 frame={frame.url[:80]}: "
+                            f"containers={info.get('all')!r} "
                             f"class={info.get('cls')!r} text={info.get('text')!r} "
                             f"kids={info.get('kids')!r}"
                         )
@@ -754,6 +756,22 @@ class BrowserLoginHelper:
         await page.mouse.up()
         await asyncio.sleep(0.3)
 
+    async def _get_rotate_transform(self, page) -> str:
+        """读取旋转图片当前 transform（验证拖动是否真的转动图片）"""
+        for frame in page.frames:
+            try:
+                t = await self._eval_captcha(frame, """{
+                    const img = d.querySelector('.slot-content img') || d.querySelector('img');
+                    if (!img) return '';
+                    const cs = getComputedStyle(img);
+                    return { inline: img.style.transform || '', computed: cs.transform || '' };
+                }""")
+                if t:
+                    return f"inline={t.get('inline')!r} computed={t.get('computed')!r}"
+            except Exception:
+                continue
+        return ""
+
     async def _solve_rotate(self, page) -> Tuple[bool, str]:
         """破解旋转摆正题：打码识别角度 → 拖动"""
         img_b64 = await self._extract_image_b64(page)
@@ -792,22 +810,38 @@ class BrowserLoginHelper:
         if slider_w <= 5 or (sizes and slider_w > (sizes.get("slide_path") or 0)):
             slider_w = 45  # 滑块宽异常（IMG 未加载/0）时按常见值估算
         travel = 0
-        if sizes and sizes.get("slide_path"):
+        # 轨道/拖动区必须明显宽于滑块才有效；slide_path 异常小（=滑块宽）时跳过用拖动区
+        if sizes and (sizes.get("slide_path") or 0) - slider_w > 20:
             travel = sizes["slide_path"] - slider_w
-        elif sizes and sizes.get("drag_box"):
+        elif sizes and (sizes.get("drag_box") or 0) - slider_w > 20:
             travel = sizes["drag_box"] - slider_w
-        elif sizes and sizes.get("slot"):
+        elif sizes and (sizes.get("slot") or 0) - slider_w > 20:
             travel = sizes["slot"] - slider_w
         if travel <= 0:
             travel = 260  # 兜底经验值（京东旋转题常见行程）
-        logger.info(f"旋转题尺寸: 轨道={sizes.get('slide_path') if sizes else 'N/A'} 拖动区={sizes.get('drag_box') if sizes else 'N/A'} 图片={sizes.get('slot') if sizes else 'N/A'} 滑块={slider_w}, 满行程={int(travel)}px")
+        logger.info(f"旋转题尺寸: 轨道={sizes.get('slide_path') if sizes else 'N/A'} 拖动区={sizes.get('drag_box') if sizes else 'N/A'} 图片={sizes.get('slot') if sizes else 'N/A'} 滑块={slider_w}, 满行程={int(travel)}px, 滑块box=({int(box['x'])},{int(box['y'])},{int(box['width'])}x{int(box['height'])})")
         direction = int(self.config.get("jd_browser_rotate_direction", 1))
-        angle_norm = angle % 360
-        distance = angle_norm / 360 * travel * direction
+        # 角度归一化到 [-180, 180]：-56 表示逆时针歪 56°，回正需顺时针 56°，京东滑块向右拖即顺时针
+        angle_norm = ((angle % 360) + 360) % 360
+        if angle_norm > 180:
+            angle_norm -= 360
+        distance = abs(angle_norm) / 360 * travel * direction
         if distance < 0:
-            distance = -(360 - angle_norm) / 360 * travel * direction  # 反向拖等价距离
-        logger.info(f"旋转题: 识别角度={angle}°, 拖动距离={int(distance)}px")
+            distance = abs(angle_norm) / 360 * travel  # 反向配置时取正向距离
+        logger.info(f"旋转题: 识别角度={angle}°, 归一化={angle_norm}°, 拖动距离={int(distance)}px")
         await self._drag_human(page, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, distance)
+        # 拖动生效自检：读旋转图片 transform，确认图片确实被转动
+        try:
+            rot_before = await self._get_rotate_transform(page)
+            logger.info(f"旋转题自检: 拖动前图片transform={rot_before}")
+        except Exception:
+            logger.info("旋转题自检: 无法读取拖动前 transform")
+        await asyncio.sleep(1.0)
+        try:
+            rot_after = await self._get_rotate_transform(page)
+            logger.info(f"旋转题自检: 拖动后图片transform={rot_after}")
+        except Exception:
+            logger.info("旋转题自检: 无法读取拖动后 transform")
         # 同题微调：弹窗未消失则按 ±30°/±60° 偏移重拖（同一验证码，不重新打码）
         for off_deg in (30, -30, 60, -60):
             if await self._wait_captcha_gone(page, timeout_s=2.5):
@@ -815,8 +849,8 @@ class BrowserLoginHelper:
             nb = await slide.bounding_box()
             if not nb:
                 break
-            d2 = (angle_norm + off_deg) / 360 * travel * direction
-            logger.info(f"旋转题同题微调: 偏移 {off_deg:+d}°")
+            d2 = abs(((angle_norm + off_deg + 180) % 360) - 180) / 360 * travel
+            logger.info(f"旋转题同题微调: 偏移 {off_deg:+d}° -> 距离 {int(d2)}px")
             await self._drag_human(page, nb["x"] + nb["width"] / 2, nb["y"] + nb["height"] / 2, d2)
         return True, f"已按 {angle}° 拖动（含微调）"
 
@@ -2235,7 +2269,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.20)")
+        logger.info("青龙面板插件已加载 (v1.5.21)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -3061,7 +3095,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.20
+        help_text = """📦 青龙面板管理插件 v1.5.21
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
