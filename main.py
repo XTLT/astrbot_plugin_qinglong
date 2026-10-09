@@ -607,26 +607,7 @@ class BrowserLoginHelper:
     async def _detect_type(self, page) -> str:
         """检测当前验证码题型：rotate(旋转摆正) / arrow(拖动箭头填充拼图) / track(轨迹绘制) / gap(缺口拼图) / unknown"""
         try:
-            _, slider = await self._find_in_frames(page, ".captcha_drop #slider-div")
-            if slider is not None:
-                return "rotate"
-            _, arrow = await self._find_in_frames(page, ".captcha_drop .move-img")
-            if arrow is not None:
-                return "arrow"
-            for frame in page.frames:
-                try:
-                    text = await frame.evaluate("""() => {
-                        const d = document.querySelector('.captcha_drop');
-                        return d ? (d.innerText || '') : '';
-                    }""")
-                    if text and ("轨迹" in text or "绘制" in text):
-                        return "track"
-                except Exception:
-                    continue
-            _, canvas = await self._find_in_frames(page, ".captcha_drop canvas")
-            if canvas is not None:
-                return "gap"
-            # 诊断：无条件输出弹窗结构（含所有 frame），便于适配新题型
+            # 诊断：无条件输出弹窗结构（含所有 frame），便于适配新题型（任何题型都打印）
             for frame in page.frames:
                 try:
                     info = await frame.evaluate("""() => {
@@ -650,6 +631,26 @@ class BrowserLoginHelper:
                         logger.info(f"验证码弹窗诊断 frame={frame.url[:80]}: 无 .captcha_drop")
                 except Exception as e:
                     logger.info(f"验证码弹窗诊断 frame={frame.url[:80]} 访问失败: {str(e)[:120]}")
+            # 题型判定
+            _, slider = await self._find_in_frames(page, ".captcha_drop #slider-div")
+            if slider is not None:
+                return "rotate"
+            _, arrow = await self._find_in_frames(page, ".captcha_drop .move-img")
+            if arrow is not None:
+                return "arrow"
+            for frame in page.frames:
+                try:
+                    text = await frame.evaluate("""() => {
+                        const d = document.querySelector('.captcha_drop');
+                        return d ? (d.innerText || '') : '';
+                    }""")
+                    if text and ("轨迹" in text or "绘制" in text):
+                        return "track"
+                except Exception:
+                    continue
+            _, canvas = await self._find_in_frames(page, ".captcha_drop canvas")
+            if canvas is not None:
+                return "gap"
             return "unknown"
         except Exception:
             return "unknown"
@@ -2111,7 +2112,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.14)")
+        logger.info("青龙面板插件已加载 (v1.5.15)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -2937,7 +2938,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.14
+        help_text = """📦 青龙面板管理插件 v1.5.15
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
