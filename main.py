@@ -757,17 +757,25 @@ class BrowserLoginHelper:
         await asyncio.sleep(0.3)
 
     async def _get_rotate_transform(self, page) -> str:
-        """读取旋转图片当前 transform（验证拖动是否真的转动图片）"""
+        """读取旋转图片当前 transform（验证拖动是否真的转动图片）。slot-content 可能含多个 img，遍历取非 none 的。"""
         for frame in page.frames:
             try:
                 t = await self._eval_captcha(frame, """{
-                    const img = d.querySelector('.slot-content img') || d.querySelector('img');
-                    if (!img) return '';
-                    const cs = getComputedStyle(img);
-                    return { inline: img.style.transform || '', computed: cs.transform || '' };
+                    const imgs = d.querySelectorAll('.slot-content img, .slot-content canvas, #main_img, #slot_img');
+                    const out = [];
+                    for (const el of imgs) {
+                        const cs = getComputedStyle(el);
+                        const tag = el.tagName + '#' + (el.id || '') + '.' + ((el.className && el.className.baseVal) || el.className || '');
+                        out.push({ tag: tag.slice(0,40), inline: el.style.transform || '', computed: cs.transform || '' });
+                    }
+                    return out;
                 }""")
                 if t:
-                    return f"inline={t.get('inline')!r} computed={t.get('computed')!r}"
+                    # 返回第一个 computed 非 none 的；全部 none 则返回全部（便于诊断）
+                    for one in t:
+                        if one.get("computed") and one["computed"] != "none":
+                            return f"tag={one.get('tag')} inline={one.get('inline')!r} computed={one.get('computed')!r}"
+                    return f"ALL_NONE({len(t)} imgs): " + "; ".join(f"{o.get('tag')}={o.get('computed')}" for o in t[:4])
             except Exception:
                 continue
         return ""
@@ -949,9 +957,16 @@ class BrowserLoginHelper:
         for frame in page.frames:
             try:
                 target = await self._eval_captcha(frame, """{
-                    const t = (d.innerText || '');
-                    const m = t.match(/请点击上图中的[：:]\\s*([^\\n]+)/);
-                    return m ? m[1].trim() : '';
+                    const tips = d.querySelector('.tips_container') || d.querySelector('.tip_text_container') || d.querySelector('.cpc-img-overlay') || d;
+                    let t = (tips.innerText || d.innerText || '');
+                    const m = t.match(/请点击上图中的[：:]\\s*([^\\n]+)/) || t.match(/请点击上图[：:]\\s*([^\\n]+)/);
+                    let word = m ? m[1].trim() : '';
+                    if (!word && t.indexOf('请点击') >= 0) {
+                        const rest = t.slice(t.indexOf('请点击') + 6).trim();
+                        const firstLine = rest.split(/[\\n，,。\\s]+/)[0];
+                        if (firstLine && firstLine.length <= 12) word = firstLine;
+                    }
+                    return word;
                 }""")
                 if target:
                     break
@@ -2305,7 +2320,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.23)")
+        logger.info("青龙面板插件已加载 (v1.5.24)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -3131,7 +3146,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.23
+        help_text = """📦 青龙面板管理插件 v1.5.24
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
