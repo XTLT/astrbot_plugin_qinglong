@@ -565,7 +565,7 @@ class BrowserLoginHelper:
             "jd_captcha_username / jd_captcha_password"
         )
 
-    async def _ttshitu(self, image_b64: str, typeid: str, imageback_b64: str = "") -> Tuple[bool, str]:
+    async def _ttshitu(self, image_b64: str, typeid: str, imageback_b64: str = "", content: str = "") -> Tuple[bool, str]:
         """调用图鉴通用识别接口。返回 (ok, result)"""
         try:
             payload = {
@@ -576,6 +576,8 @@ class BrowserLoginHelper:
             }
             if imageback_b64:
                 payload["imageback"] = imageback_b64
+            if content:
+                payload["content"] = content
             url = self.config.get("jd_captcha_api_url", "http://api.ttshitu.com/predict")
             timeout = httpx.Timeout(60.0)
             async with httpx.AsyncClient(timeout=timeout) as client:
@@ -646,6 +648,8 @@ class BrowserLoginHelper:
                     }""")
                     if text and ("轨迹" in text or "绘制" in text):
                         return "track"
+                    if text and ("请点击上图" in text or "点击图中的" in text):
+                        return "click"
                 except Exception:
                     continue
             _, canvas = await self._find_in_frames(page, ".captcha_drop canvas")
@@ -836,6 +840,58 @@ class BrowserLoginHelper:
                 await asyncio.sleep(0.03)
         await page.mouse.up()
         return True, f"已按 {len(pts)} 个轨迹点绘制"
+
+    async def _solve_click(self, page) -> Tuple[bool, str]:
+        """破解点选验证码：提取提示目标词 + 图鉴点选识别坐标 → 依次点击图中目标"""
+        # 1. 提取提示目标词（"请点击上图中的：xxx"）
+        target = ""
+        for frame in page.frames:
+            try:
+                target = await frame.evaluate("""() => {
+                    const d = document.querySelector('.captcha_drop');
+                    if (!d) return '';
+                    const t = (d.innerText || '');
+                    const m = t.match(/请点击上图中的[：:]\\s*([^\\n]+)/);
+                    return m ? m[1].trim() : '';
+                }""")
+                if target:
+                    break
+            except Exception:
+                continue
+        # 2. 提取点选图
+        img_b64 = await self._extract_image_b64(page)
+        if not img_b64:
+            return False, "未获取到点选图"
+        # 3. 图鉴点选识别（27 点选1~4个坐标，content 传目标词）
+        ok, result = await self._ttshitu(img_b64, "27", content=target)
+        if not ok:
+            return False, f"点选识别失败: {result}"
+        pts = self._parse_track_points(result)
+        if not pts:
+            return False, f"点选坐标解析失败: {result[:60]}"
+        # 4. 图片位置换算 + 依次点击
+        img_box = None
+        for frame in page.frames:
+            try:
+                img_box = await frame.evaluate("""() => {
+                    const el = document.querySelector('.captcha_drop #cpc_img') || document.querySelector('.captcha_drop .slot-content img');
+                    if (!el) return null;
+                    const r = el.getBoundingClientRect();
+                    return {x: r.x, y: r.y, w: r.width, h: r.height, nw: el.naturalWidth, nh: el.naturalHeight};
+                }""")
+                if img_box:
+                    break
+            except Exception:
+                continue
+        if not img_box:
+            return False, "未找到点选图位置"
+        scale_x = img_box["w"] / max(img_box["nw"], 1)
+        scale_y = img_box["h"] / max(img_box["nh"], 1)
+        logger.info(f"点选题: 目标={target}, 识别到 {len(pts)} 个坐标")
+        for (px, py) in pts:
+            await page.mouse.click(img_box["x"] + px * scale_x, img_box["y"] + py * scale_y)
+            await asyncio.sleep(0.4)
+        return True, f"已点击 {len(pts)} 个位置"
 
     async def _solve_gap(self, page) -> Tuple[bool, str]:
         """破解缺口拼图题：图鉴单缺口识别（typeid 33）返回 X 坐标 → 拖动"""
@@ -1080,6 +1136,8 @@ class BrowserLoginHelper:
                         ok, last_err = await self._solve_arrow(page)
                     elif ctype == "track":
                         ok, last_err = await self._solve_track(page)
+                    elif ctype == "click":
+                        ok, last_err = await self._solve_click(page)
                     elif ctype == "gap":
                         ok, last_err = await self._solve_gap(page)
                     else:
@@ -2145,7 +2203,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.17)")
+        logger.info("青龙面板插件已加载 (v1.5.18)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -2971,7 +3029,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.17
+        help_text = """📦 青龙面板管理插件 v1.5.18
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
