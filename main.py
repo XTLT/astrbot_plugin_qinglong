@@ -747,7 +747,7 @@ class BrowserLoginHelper:
         """第一步：打开登录页 → 输入手机号 → 破解验证码 → 等待发码。
         成功后将浏览器会话保存在 self._sessions[session_id]，等待用户回传验证码。
         """
-        ok, msg = await self._captcha_ready()
+        ok, msg = self._captcha_ready()
         if not ok:
             return False, msg
 
@@ -1874,7 +1874,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.0)")
+        logger.info("青龙面板插件已加载 (v1.5.1)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -2378,9 +2378,26 @@ class QinglongPlugin(Star):
             await self.context.send_message(event.unified_msg_origin, MessageChain().message(text))
     
     def _is_group_message(self, event: AstrMessageEvent) -> bool:
-        """判断消息是否为群消息"""
+        """判断消息是否为群消息（兼容 unified_msg_origin 与 message_obj 两种判断）"""
         umo = event.unified_msg_origin or ""
-        return "GroupMessage" in umo
+        if "GroupMessage" in umo:
+            return True
+        if "FriendMessage" in umo:
+            return False
+        try:
+            mobj = getattr(event, "message_obj", None)
+            mtype = getattr(mobj, "message_type", None)
+            if mtype is None and isinstance(mobj, dict):
+                mtype = mobj.get("message_type")
+            mtype_str = str(mtype or "").lower()
+            if mtype_str:
+                if any(k in mtype_str for k in ("group", "群")):
+                    return True
+                if any(k in mtype_str for k in ("private", "friend", "c2c", "私聊")):
+                    return False
+        except Exception:
+            pass
+        return False
     
     def _get_sender_id(self, event: AstrMessageEvent) -> str:
         """获取发送者ID"""
@@ -2683,7 +2700,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.0
+        help_text = """📦 青龙面板管理插件 v1.5.1
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
