@@ -645,7 +645,7 @@ class BrowserLoginHelper:
                             try { cn = (typeof e.className === 'string') ? e.className : ((e.className && e.className.baseVal) || ''); } catch (err) { cn = ''; }
                             return e.tagName + '#' + (e.id || '') + '.' + cn.split(' ').slice(0,2).join('.');
                         }).slice(0,25);
-                        return { text: (d.innerText||'').slice(0,200), html: (d.innerHTML||'').slice(0,400), cls: cls, kids: kids };
+                        return { all: all, text: (d.innerText||'').slice(0,200), html: (d.innerHTML||'').slice(0,400), cls: cls, kids: kids };
                     }""")
                     if info:
                         logger.info(
@@ -892,7 +892,7 @@ class BrowserLoginHelper:
             return False, "未找到轨迹图位置"
         scale_x = img_box["w"] / max(img_box["nw"], 1)
         scale_y = img_box["h"] / max(img_box["nh"], 1)
-        logger.info(f"轨迹题: 识别到 {len(pts)} 个轨迹点")
+        logger.info(f"轨迹题: 识别到 {len(pts)} 个轨迹点, canvas_box={canvas_box}, img_box={img_box}")
         # 起点按下，逐点移动，终点松开
         first = True
         for (px, py) in pts:
@@ -953,9 +953,12 @@ class BrowserLoginHelper:
             return False, "未找到点选图位置"
         scale_x = img_box["w"] / max(img_box["nw"], 1)
         scale_y = img_box["h"] / max(img_box["nh"], 1)
-        logger.info(f"点选题: 目标={target}, 识别到 {len(pts)} 个坐标")
-        for (px, py) in pts:
-            await page.mouse.click(img_box["x"] + px * scale_x, img_box["y"] + py * scale_y)
+        logger.info(f"点选题: 目标词={target!r}, 识别到 {len(pts)} 个坐标, 图片box=({int(img_box['x'])},{int(img_box['y'])},{int(img_box['w'])}x{int(img_box['h'])}, natural={img_box['nw']}x{img_box['nh']}), scale=({scale_x:.3f},{scale_y:.3f})")
+        for i, (px, py) in enumerate(pts, 1):
+            cx = img_box["x"] + px * scale_x
+            cy = img_box["y"] + py * scale_y
+            logger.info(f"点选题: 点击 {i}/{len(pts)} -> 图鉴坐标({px},{py}) => 页面({int(cx)},{int(cy)})")
+            await page.mouse.click(cx, cy)
             await asyncio.sleep(0.4)
         return True, f"已点击 {len(pts)} 个位置"
 
@@ -2269,7 +2272,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.21)")
+        logger.info("青龙面板插件已加载 (v1.5.22)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -3095,7 +3098,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.21
+        help_text = """📦 青龙面板管理插件 v1.5.22
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
