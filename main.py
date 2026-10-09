@@ -862,17 +862,17 @@ class BrowserLoginHelper:
                 continue
         if not main_b64:
             return False, "未获取到拼图主图"
-        # 2. 打码识别目标 X 坐标（优先双图缺口 18，回退单图 33/1033）
-        ok, result = await self._ttshitu(
-            main_b64,
-            str(self.config.get("jd_captcha_gap_typeid", "33")),
-            imageback_b64=slot_b64 or "",
-        )
+        # 2. 打码识别目标 X 坐标：优先 1033 拖动拼图（双图，京东箭头拼图专用，可排除伪缺口），失败回退 33 单缺口
+        arrow_typeid = str(self.config.get("jd_captcha_arrow_typeid", "1033"))
+        ok, result = await self._ttshitu(main_b64, arrow_typeid, imageback_b64=slot_b64 or "")
+        if not ok:
+            ok, result = await self._ttshitu(main_b64, str(self.config.get("jd_captcha_gap_typeid", "33")))
         if not ok:
             return False, f"拼图目标识别失败: {result}"
         x = self._parse_angle(result)
         if x is None:
             return False, f"拼图目标坐标异常: {result}"
+        logger.info(f"箭头拼图题: typeid={arrow_typeid} 原始返回={result} 解析X={x}")
         # 3. 拖动箭头 move-img 到主图目标位置
         _, move_img = await self._find_in_frames(page, ".captcha_drop .move-img")
         if not move_img:
@@ -2099,7 +2099,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.12)")
+        logger.info("青龙面板插件已加载 (v1.5.13)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -2925,7 +2925,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.12
+        help_text = """📦 青龙面板管理插件 v1.5.13
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
