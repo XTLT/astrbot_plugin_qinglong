@@ -594,9 +594,21 @@ class BrowserLoginHelper:
     # 验证码题型识别与破解
     # ------------------------------------------------------------------
     async def _find_in_frames(self, page, selector: str):
-        """在所有 frame（含 iframe）中查找第一个匹配元素。
-        京东验证码组件可能加载在 iframe 中，主文档查询会漏掉。
+        """在所有 frame（含 iframe）中查找第一个**可见**匹配元素。
+        京东页面可能预置隐藏的验证码容器，query_selector 默认返回 DOM 第一个（可能是隐藏的），
+        因此优先遍历所有匹配元素并返回 is_visible 为 True 的；全部不可见时兜底返回第一个。
         返回 (frame, element_handle)；找不到返回 (None, None)。"""
+        for frame in page.frames:
+            try:
+                els = await frame.query_selector_all(selector)
+                for el in els:
+                    try:
+                        if await el.is_visible():
+                            return frame, el
+                    except Exception:
+                        continue
+            except Exception:
+                continue
         for frame in page.frames:
             try:
                 el = await frame.query_selector(selector)
@@ -606,15 +618,26 @@ class BrowserLoginHelper:
                 continue
         return None, None
 
+    async def _eval_captcha(self, frame, js_body: str):
+        """在指定 frame 中对「可见的 .captcha_drop」执行 JS。js_body 内用变量 d 引用容器。"""
+        js = """() => {
+            const all = Array.from(document.querySelectorAll('.captcha_drop')).filter(el => {
+                const r = el.getBoundingClientRect();
+                return r.width > 50 && r.height > 50;
+            });
+            const d = (all.length ? all[all.length - 1] : document.querySelector('.captcha_drop'));
+            if (!d) return null;
+            """ + js_body + """
+        }"""
+        return await frame.evaluate(js)
+
     async def _detect_type(self, page) -> str:
-        """检测当前验证码题型：rotate(旋转摆正) / arrow(拖动箭头填充拼图) / track(轨迹绘制) / gap(缺口拼图) / unknown"""
+        """检测当前验证码题型：rotate(旋转摆正) / arrow(拖动箭头填充拼图) / track(轨迹绘制) / gap(缺口拼图) / click(点选) / unknown"""
         try:
-            # 诊断：无条件输出弹窗结构（含所有 frame），便于适配新题型（任何题型都打印）
+            # 诊断：无条件输出可见弹窗结构（含所有 frame），便于适配新题型（任何题型都打印）
             for frame in page.frames:
                 try:
-                    info = await frame.evaluate("""() => {
-                        const d = document.querySelector('.captcha_drop');
-                        if (!d) return null;
+                    info = await self._eval_captcha(frame, """{
                         const cls = (typeof d.className === 'string') ? d.className : ((d.className && d.className.baseVal) || '');
                         const kids = Array.from(d.querySelectorAll('*')).map(e => {
                             let cn = '';
@@ -630,7 +653,7 @@ class BrowserLoginHelper:
                             f"kids={info.get('kids')!r}"
                         )
                     else:
-                        logger.info(f"验证码弹窗诊断 frame={frame.url[:80]}: 无 .captcha_drop")
+                        logger.info(f"验证码弹窗诊断 frame={frame.url[:80]}: 无可见 .captcha_drop")
                 except Exception as e:
                     logger.info(f"验证码弹窗诊断 frame={frame.url[:80]} 访问失败: {str(e)[:120]}")
             # 题型判定
@@ -642,10 +665,7 @@ class BrowserLoginHelper:
                 return "arrow"
             for frame in page.frames:
                 try:
-                    text = await frame.evaluate("""() => {
-                        const d = document.querySelector('.captcha_drop');
-                        return d ? (d.innerText || '') : '';
-                    }""")
+                    text = await self._eval_captcha(frame, "return (d.innerText || '');")
                     if text and ("轨迹" in text or "绘制" in text):
                         return "track"
                     if text and ("请点击上图" in text or "点击图中的" in text):
@@ -665,9 +685,7 @@ class BrowserLoginHelper:
         try:
             for frame in page.frames:
                 try:
-                    src = await frame.evaluate("""() => {
-                        const d = document.querySelector('.captcha_drop');
-                        if (!d) return '';
+                    src = await self._eval_captcha(frame, """{
                         const img = d.querySelector('#cpc_img') || d.querySelector('.slot-content img') || d.querySelector('img');
                         return img ? img.src : '';
                     }""")
@@ -758,9 +776,7 @@ class BrowserLoginHelper:
         sizes = None
         for frame in page.frames:
             try:
-                sizes = await frame.evaluate("""() => {
-                    const d = document.querySelector('.captcha_drop');
-                    if (!d) return null;
+                sizes = await self._eval_captcha(frame, """{
                     const w = (el) => el ? (el.getBoundingClientRect().width || el.offsetWidth || 0) : 0;
                     const sp = d.querySelector('#slide_path') || d.querySelector('.slide_path');
                     const db = d.querySelector('.drag-box');
@@ -820,9 +836,9 @@ class BrowserLoginHelper:
         img_box = None
         for frame in page.frames:
             try:
-                boxes = await frame.evaluate("""() => {
-                    const c = document.querySelector('.captcha_drop #trackLine');
-                    const i = document.querySelector('.captcha_drop #cpc_img');
+                boxes = await self._eval_captcha(frame, """{
+                    const c = d.querySelector('#trackLine');
+                    const i = d.querySelector('#cpc_img');
                     const r = (el) => { const b = el.getBoundingClientRect(); return {x: b.x, y: b.y, w: b.width, h: b.height}; };
                     return {
                         c: c ? r(c) : null,
@@ -865,9 +881,7 @@ class BrowserLoginHelper:
         target = ""
         for frame in page.frames:
             try:
-                target = await frame.evaluate("""() => {
-                    const d = document.querySelector('.captcha_drop');
-                    if (!d) return '';
+                target = await self._eval_captcha(frame, """{
                     const t = (d.innerText || '');
                     const m = t.match(/请点击上图中的[：:]\\s*([^\\n]+)/);
                     return m ? m[1].trim() : '';
@@ -891,8 +905,8 @@ class BrowserLoginHelper:
         img_box = None
         for frame in page.frames:
             try:
-                img_box = await frame.evaluate("""() => {
-                    const el = document.querySelector('.captcha_drop #cpc_img') || document.querySelector('.captcha_drop .slot-content img');
+                img_box = await self._eval_captcha(frame, """{
+                    const el = d.querySelector('#cpc_img') || d.querySelector('.slot-content img');
                     if (!el) return null;
                     const r = el.getBoundingClientRect();
                     return {x: r.x, y: r.y, w: r.width, h: r.height, nw: el.naturalWidth, nh: el.naturalHeight};
@@ -955,9 +969,9 @@ class BrowserLoginHelper:
         main_b64, slot_b64 = "", ""
         for frame in page.frames:
             try:
-                srcs = await frame.evaluate("""() => {
-                    const m = document.querySelector('#main_img');
-                    const s = document.querySelector('#slot_img');
+                srcs = await self._eval_captcha(frame, """{
+                    const m = d.querySelector('#main_img');
+                    const s = d.querySelector('#slot_img');
                     return { m: m ? m.src : '', s: s ? s.src : '' };
                 }""")
                 if srcs and srcs.get("m") and "," in srcs["m"]:
@@ -992,8 +1006,8 @@ class BrowserLoginHelper:
         img_pos = None
         for frame in page.frames:
             try:
-                img_pos = await frame.evaluate("""() => {
-                    const el = document.querySelector('#main_img');
+                img_pos = await self._eval_captcha(frame, """{
+                    const el = d.querySelector('#main_img');
                     if (!el) return null;
                     const r = el.getBoundingClientRect();
                     return {x: r.x, w: r.width, nw: el.naturalWidth};
@@ -2221,7 +2235,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.19)")
+        logger.info("青龙面板插件已加载 (v1.5.20)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -3047,7 +3061,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.19
+        help_text = """📦 青龙面板管理插件 v1.5.20
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
