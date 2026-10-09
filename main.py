@@ -1324,26 +1324,30 @@ class BrowserLoginHelper:
                 except Exception:
                     pass
 
-            # 提取 Cookie（pt_key / pt_pin）
-            await asyncio.sleep(2)
-            cookies = await context.cookies()
+            # 提取 Cookie（pt_key / pt_pin）：跳转后轮询最长 15 秒（Cookie 种下有延迟）
+            final_url = page.url
+            cookie = ""
             pairs = {}
-            for c in cookies:
-                if c["name"].startswith("pt_") and c["value"]:
-                    pairs[c["name"]] = c["value"]
-            cookie = ";".join(f"{k}={v}" for k, v in pairs.items())
-            if "pt_key=" in cookie and "pt_pin=" in cookie:
-                return True, "登录成功", cookie
-            # 未取到完整 cookie：再等一会重试一次
-            await asyncio.sleep(3)
-            cookies = await context.cookies()
-            pairs = {}
-            for c in cookies:
-                if c["name"].startswith("pt_") and c["value"]:
-                    pairs[c["name"]] = c["value"]
-            cookie = ";".join(f"{k}={v}" for k, v in pairs.items())
-            if "pt_key=" in cookie and "pt_pin=" in cookie:
-                return True, "登录成功", cookie
+            for _ in range(10):
+                await asyncio.sleep(1.5)
+                try:
+                    cookies = await context.cookies()
+                    pairs = {}
+                    for c in cookies:
+                        if c["name"].startswith("pt_") and c["value"]:
+                            pairs[c["name"]] = c["value"]
+                    cookie = ";".join(f"{k}={v}" for k, v in pairs.items())
+                    if "pt_key=" in cookie and "pt_pin=" in cookie:
+                        return True, "登录成功", cookie
+                except Exception:
+                    pass
+            # 仍未取到：打印诊断（最终URL/Cookie名称列表/页面文本），便于定位
+            try:
+                names = [c["name"] for c in await context.cookies()]
+                body = (await page.evaluate("() => document.body.innerText || ''"))[:200]
+                logger.info(f"登录Cookie提取失败诊断: 最终URL={final_url}, cookie名称={names}, 当前pt_对={list(pairs.keys())}, body={body!r}")
+            except Exception as e:
+                logger.info(f"登录Cookie提取诊断失败: {e}")
             return False, "登录后未获取到完整 Cookie（pt_key/pt_pin），请重新尝试", cookie
         except Exception as e:
             logger.error(f"提交验证码异常: {e}")
@@ -2323,7 +2327,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.26)")
+        logger.info("青龙面板插件已加载 (v1.5.27)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -3149,7 +3153,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.26
+        help_text = """📦 青龙面板管理插件 v1.5.27
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
