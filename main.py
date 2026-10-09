@@ -605,11 +605,14 @@ class BrowserLoginHelper:
         return None, None
 
     async def _detect_type(self, page) -> str:
-        """检测当前验证码题型：rotate(旋转摆正) / track(轨迹绘制) / gap(缺口拼图) / unknown"""
+        """检测当前验证码题型：rotate(旋转摆正) / arrow(拖动箭头填充拼图) / track(轨迹绘制) / gap(缺口拼图) / unknown"""
         try:
             _, slider = await self._find_in_frames(page, ".captcha_drop #slider-div")
             if slider is not None:
                 return "rotate"
+            _, arrow = await self._find_in_frames(page, ".captcha_drop .move-img")
+            if arrow is not None:
+                return "arrow"
             for frame in page.frames:
                 try:
                     text = await frame.evaluate("""() => {
@@ -837,6 +840,70 @@ class BrowserLoginHelper:
         await self._drag_human(page, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, distance)
         return True, f"已按缺口 X={x} 拖动"
 
+    async def _solve_arrow(self, page) -> Tuple[bool, str]:
+        """破解京东'拖动箭头填充拼图'：识别主图目标位置 → 拖动 .move-img 箭头对齐。
+        结构：#main_img 主图 / #slot_img 拼图块 / .slide_path 轨道 / .move-img 箭头。"""
+        # 1. 提取主图与缺口块图 base64
+        main_b64, slot_b64 = "", ""
+        for frame in page.frames:
+            try:
+                srcs = await frame.evaluate("""() => {
+                    const m = document.querySelector('#main_img');
+                    const s = document.querySelector('#slot_img');
+                    return { m: m ? m.src : '', s: s ? s.src : '' };
+                }""")
+                if srcs and srcs.get("m") and "," in srcs["m"]:
+                    main_b64 = srcs["m"].split(",", 1)[1]
+                if srcs and srcs.get("s") and "," in srcs["s"]:
+                    slot_b64 = srcs["s"].split(",", 1)[1]
+                if main_b64:
+                    break
+            except Exception:
+                continue
+        if not main_b64:
+            return False, "未获取到拼图主图"
+        # 2. 打码识别目标 X 坐标（优先双图缺口 18，回退单图 33/1033）
+        ok, result = await self._ttshitu(
+            main_b64,
+            str(self.config.get("jd_captcha_gap_typeid", "33")),
+            imageback_b64=slot_b64 or "",
+        )
+        if not ok:
+            return False, f"拼图目标识别失败: {result}"
+        x = self._parse_angle(result)
+        if x is None:
+            return False, f"拼图目标坐标异常: {result}"
+        # 3. 拖动箭头 move-img 到主图目标位置
+        _, move_img = await self._find_in_frames(page, ".captcha_drop .move-img")
+        if not move_img:
+            return False, "未找到箭头拖动块"
+        mbox = await move_img.bounding_box()
+        if not mbox:
+            return False, "箭头位置不可用"
+        # 主图视口位置与缩放
+        img_pos = None
+        for frame in page.frames:
+            try:
+                img_pos = await frame.evaluate("""() => {
+                    const el = document.querySelector('#main_img');
+                    if (!el) return null;
+                    const r = el.getBoundingClientRect();
+                    return {x: r.x, w: r.width, nw: el.naturalWidth};
+                }""")
+                if img_pos:
+                    break
+            except Exception:
+                continue
+        if not img_pos or not img_pos.get("nw"):
+            return False, "未找到主图位置"
+        scale = img_pos["w"] / max(img_pos["nw"], 1)
+        target_x = img_pos["x"] + x * scale
+        start_x = mbox["x"] + mbox["width"] / 2
+        distance = target_x - start_x
+        logger.info(f"箭头拼图题: 识别目标X={x}, 主图缩放={scale:.2f}, 拖动距离={int(distance)}px")
+        await self._drag_human(page, start_x, mbox["y"] + mbox["height"] / 2, distance)
+        return True, f"已按目标 X={x} 拖动箭头"
+
     async def _refresh_captcha(self, page):
         """点击验证码弹窗的刷新按钮换题"""
         try:
@@ -956,6 +1023,8 @@ class BrowserLoginHelper:
                     logger.info(f"验证码破解尝试 {attempt+1}/{max_retry}: 题型={ctype}")
                     if ctype == "rotate":
                         ok, last_err = await self._solve_rotate(page)
+                    elif ctype == "arrow":
+                        ok, last_err = await self._solve_arrow(page)
                     elif ctype == "track":
                         ok, last_err = await self._solve_track(page)
                     elif ctype == "gap":
@@ -2023,7 +2092,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.10)")
+        logger.info("青龙面板插件已加载 (v1.5.11)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -2849,7 +2918,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.10
+        help_text = """📦 青龙面板管理插件 v1.5.11
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
