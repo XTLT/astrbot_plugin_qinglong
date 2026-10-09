@@ -1190,6 +1190,15 @@ class BrowserLoginHelper:
             if not ok:
                 return False, msg
 
+            # 复用持久化指纹（storage_state）：京东对"同一台设备"的风控显著低于每次全新环境
+            import os as _os, tempfile as _tf
+            state_file = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "jd_login_state.json")
+            ctx_kwargs = {}
+            if _os.path.exists(state_file):
+                try:
+                    ctx_kwargs["storage_state"] = state_file
+                except Exception:
+                    pass
             context = await self._browser.new_context(
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -1197,6 +1206,7 @@ class BrowserLoginHelper:
                 ),
                 locale="zh-CN",
                 viewport={"width": 1280, "height": 900},
+                **ctx_kwargs,
             )
             # 隐藏自动化特征，降低被京东风控多维识别（webdriver/插件/languages）的概率
             await context.add_init_script("""
@@ -1207,6 +1217,12 @@ class BrowserLoginHelper:
             """)
             page = await context.new_page()
             try:
+                # 模拟真实用户：先访问京东首页建立会话，再进登录页
+                try:
+                    await page.goto("https://www.jd.com/", timeout=30000, wait_until="domcontentloaded")
+                    await asyncio.sleep(2.5)
+                except Exception:
+                    pass
                 await page.goto(self.JD_LOGIN_URL, timeout=60000, wait_until="domcontentloaded")
                 await asyncio.sleep(5)
                 # 切到短信登录 tab
@@ -1235,6 +1251,10 @@ class BrowserLoginHelper:
                     await asyncio.sleep(3)
                     body = await page.evaluate("() => document.body.innerText || ''")
                     if "验证码已发送" in body or "发送成功" in body:
+                        try:
+                            await context.storage_state(path=state_file)
+                        except Exception:
+                            pass
                         self._sessions[session_id] = {"context": context, "page": page, "phone": phone}
                         return True, "ok"
                     await context.close()
@@ -1242,6 +1262,10 @@ class BrowserLoginHelper:
 
                 # 截图保存已移除（按用户要求，日志诊断已足够）
 
+                try:
+                    await context.storage_state(path=state_file)
+                except Exception:
+                    pass
                 # 破解验证码（重试循环）
                 max_retry = max(int(self.config.get("jd_browser_max_retry", 4)), 1)
                 last_err = "验证码破解失败"
@@ -1316,9 +1340,13 @@ class BrowserLoginHelper:
                 await asyncio.sleep(0.8)
                 try:
                     cur = page.url
+                    if "aq.jd.com" in cur or "certified" in cur:
+                        return False, "触发京东二次认证（认证魔方/人脸识别），当前环境无法自动完成。建议先用手机京东APP登录该账号一次，或更换未触发风控的账号", ""
                     if "passport.jd.com" not in cur or "uc/login" not in cur:
                         break  # 已跳转
                     body = await page.evaluate("() => document.body.innerText || ''")
+                    if any(k in body for k in ("认证魔方", "面部识别", "身份认证")):
+                        return False, "触发京东二次认证（认证魔方/人脸识别），当前环境无法自动完成。建议先用手机京东APP登录该账号一次，或更换未触发风控的账号", ""
                     if any(k in body for k in ("验证码错误", "验证码不正确", "输入错误", "验证码已过期")):
                         return False, "验证码错误或已过期，请重新发送手机号获取新验证码", ""
                 except Exception:
@@ -2327,7 +2355,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.27)")
+        logger.info("青龙面板插件已加载 (v1.5.28)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -3153,7 +3181,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.27
+        help_text = """📦 青龙面板管理插件 v1.5.28
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
