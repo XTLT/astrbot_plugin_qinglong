@@ -1,4 +1,4 @@
-# AstrBot 青龙面板管理插件 v1.5.0
+# AstrBot 青龙面板管理插件 v1.5.2
 
 通过 AstrBot 管理青龙面板的环境变量和定时任务，支持任务执行日志自动推送和定时推送。
 
@@ -83,7 +83,12 @@
    ```bash
    python -m playwright install-deps chromium
    ```
-2. **注册打码平台**（免费送测试点数）：https://www.ttshitu.com ，注册后在插件配置中填写 `jd_captcha_username` / `jd_captcha_password`。每次识别约几分钱，验证码识别失败会自动刷新换题重试。
+2. **国内网络下载失败时**：服务器直连 Playwright 官方 CDN 常超时。插件已默认走 npmmirror 国内镜像自动下载；如需手动安装：
+   ```bash
+   PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright/ python -m playwright install chromium
+   ```
+   镜像地址可在插件配置 `jd_browser_download_mirror` 中修改（留空则用官方源）。
+3. **注册打码平台**（免费送测试点数）：https://www.ttshitu.com ，注册后在插件配置中填写 `jd_captcha_username` / `jd_captcha_password`。每次识别约几分钱，验证码识别失败会自动刷新换题重试。
 
 **新增配置项（插件配置中设置）：**
 | 配置项 | 默认值 | 说明 |
@@ -91,6 +96,7 @@
 | jd_browser_enabled | true | 是否启用浏览器登录助手 |
 | jd_browser_headless | true | 无头模式运行 Chromium |
 | jd_browser_auto_install | true | 首次使用自动下载 Chromium |
+| jd_browser_download_mirror | npmmirror | Chromium 下载镜像（国内服务器防下载失败） |
 | jd_browser_max_concurrent | 1 | 同时登录会话数（每会话占 200-400MB 内存） |
 | jd_browser_max_retry | 4 | 验证码破解失败换题重试次数 |
 | jd_browser_rotate_px_per_deg | 1.0 | 旋转验证码拖动像素/角度系数 |

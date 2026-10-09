@@ -410,11 +410,12 @@ class BrowserLoginHelper:
         except Exception:
             return None
 
-    async def _run_cmd(self, cmd: list) -> Tuple[bool, str]:
+    async def _run_cmd(self, cmd: list, env: dict = None) -> Tuple[bool, str]:
         """在子进程执行命令，返回 (ok, 输出尾部)"""
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
+                env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
@@ -444,12 +445,29 @@ class BrowserLoginHelper:
                         f"{sys.executable} -m playwright install-deps chromium"
                     )
                 logger.info("Chromium 未安装，开始自动下载（首次约 130MB，请稍候）…")
-                ok, msg = await self._run_cmd([sys.executable, "-m", "playwright", "install", "chromium"])
+                # 国内网络直连 Playwright 官方 CDN 常失败，默认走 npmmirror 镜像
+                mirror = (self.config.get("jd_browser_download_mirror") or "").strip() \
+                    or "https://npmmirror.com/mirrors/playwright/"
+                env = dict(os.environ)
+                env.setdefault("PLAYWRIGHT_DOWNLOAD_HOST", mirror)
+                logger.info(f"使用镜像下载 Chromium: {mirror}")
+                ok, msg = await self._run_cmd(
+                    [sys.executable, "-m", "playwright", "install", "chromium"],
+                    env=env,
+                )
                 if not ok:
-                    return False, f"Chromium 自动安装失败：{msg}\n请手动执行安装命令后重试"
+                    return False, (
+                        "Chromium 自动安装失败（网络原因居多）。\n"
+                        "请在服务器上手动执行（已配置国内镜像）：\n"
+                        f"PLAYWRIGHT_DOWNLOAD_HOST={mirror} "
+                        f"{sys.executable} -m playwright install chromium"
+                    )
                 # Linux 下尝试补系统依赖（失败不阻塞，启动时再报）
                 if os.name == "posix":
-                    await self._run_cmd([sys.executable, "-m", "playwright", "install-deps", "chromium"])
+                    await self._run_cmd(
+                        [sys.executable, "-m", "playwright", "install-deps", "chromium"],
+                        env=env,
+                    )
             else:
                 logger.info(f"Chromium 已就绪: {exe}")
 
@@ -1874,7 +1892,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.1)")
+        logger.info("青龙面板插件已加载 (v1.5.2)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -2700,7 +2718,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.1
+        help_text = """📦 青龙面板管理插件 v1.5.2
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
