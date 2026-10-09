@@ -640,18 +640,20 @@ class BrowserLoginHelper:
                     info = await self._eval_captcha(frame, """{
                         const all = Array.from(document.querySelectorAll('.captcha_drop')).map(el => { const r = el.getBoundingClientRect(); return {w: Math.round(r.width), h: Math.round(r.height), vis: r.width > 50 && r.height > 50}; });
                         const cls = (typeof d.className === 'string') ? d.className : ((d.className && d.className.baseVal) || '');
+                        const tips = (d.querySelector('.tips_container') || d.querySelector('.tip_text_container') || d.querySelector('.cpc-img-overlay') || null);
                         const kids = Array.from(d.querySelectorAll('*')).map(e => {
                             let cn = '';
                             try { cn = (typeof e.className === 'string') ? e.className : ((e.className && e.className.baseVal) || ''); } catch (err) { cn = ''; }
                             return e.tagName + '#' + (e.id || '') + '.' + cn.split(' ').slice(0,2).join('.');
                         }).slice(0,25);
-                        return { all: all, text: (d.innerText||'').slice(0,200), html: (d.innerHTML||'').slice(0,400), cls: cls, kids: kids };
+                        return { all: all, text: (d.innerText||'').slice(0,200), tips_text: tips ? (tips.innerText||'').slice(0,100) : '', html: (d.innerHTML||'').slice(0,400), cls: cls, kids: kids };
                     }""")
                     if info:
                         logger.info(
                             f"验证码弹窗诊断 frame={frame.url[:80]}: "
                             f"containers={info.get('all')!r} "
                             f"class={info.get('cls')!r} text={info.get('text')!r} "
+                            f"tips_text={info.get('tips_text')!r} "
                             f"kids={info.get('kids')!r}"
                         )
                     else:
@@ -736,23 +738,25 @@ class BrowserLoginHelper:
         return None
 
     async def _drag_human(self, page, start_x: float, start_y: float, distance: float, y_jitter: float = 2.0):
-        """类人拖动：先快后慢 + 轻微抖动"""
-        import random
+        """类人拖动：悬停→按下→ease-out 曲线+正弦摆动→回弹→松开（规避机械轨迹风控）"""
+        import random, math
         await page.mouse.move(start_x, start_y)
+        await asyncio.sleep(random.uniform(0.25, 0.45))  # 悬停再按下
         await page.mouse.down()
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(random.uniform(0.08, 0.15))
         total = distance  # 可为负（向左拖）
-        steps = max(int(abs(total) / 3), 6)
-        # 前 60% 走完 80% 距离（快），后 40% 走完 20%（慢，对齐）
-        fast_end = int(steps * 0.6)
+        steps = max(int(abs(total) / 2.2), 10)
+        # 人手拖动：加速起步→匀速→减速收尾（ease-out），叠加轻微正弦摆动
         for i in range(1, steps + 1):
-            if i <= fast_end:
-                x = start_x + total * (0.8 * i / fast_end)
-            else:
-                x = start_x + total * (0.8 + 0.2 * (i - fast_end) / (steps - fast_end))
-            y = start_y + random.uniform(-y_jitter, y_jitter)
-            await page.mouse.move(x, y, steps=2)
-            await asyncio.sleep(random.uniform(0.012, 0.035))
+            t = i / steps
+            progress = 1 - (1 - t) ** 2.3  # ease-out 曲线
+            x = start_x + total * progress
+            y = start_y + math.sin(t * math.pi * 2.5) * 2.5 + random.uniform(-1.5, 1.5)
+            await page.mouse.move(x, y, steps=1)
+            await asyncio.sleep(random.uniform(0.008, 0.02))
+        # 人手收尾会轻微回弹 1~3px
+        await page.mouse.move(start_x + total * random.uniform(0.98, 0.995), start_y + random.uniform(-1, 1), steps=3)
+        await asyncio.sleep(random.uniform(0.1, 0.25))
         await page.mouse.up()
         await asyncio.sleep(0.3)
 
@@ -1236,14 +1240,7 @@ class BrowserLoginHelper:
                     await context.close()
                     return False, f"未弹出验证码且未发送成功：{body[:120]}"
 
-                # 保存验证码弹窗截图（诊断用，登录失败后可查看弹窗真实内容）
-                try:
-                    import tempfile, os as _os
-                    shot = _os.path.join(tempfile.gettempdir(), f"jd_captcha_{int(time.time())}.png")
-                    await page.screenshot(path=shot)
-                    logger.info(f"验证码弹窗截图已保存: {shot}")
-                except Exception as e:
-                    logger.info(f"验证码弹窗截图失败: {str(e)[:120]}")
+                # 截图保存已移除（按用户要求，日志诊断已足够）
 
                 # 破解验证码（重试循环）
                 max_retry = max(int(self.config.get("jd_browser_max_retry", 4)), 1)
@@ -2326,7 +2323,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.25)")
+        logger.info("青龙面板插件已加载 (v1.5.26)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -3152,7 +3149,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.25
+        help_text = """📦 青龙面板管理插件 v1.5.26
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
