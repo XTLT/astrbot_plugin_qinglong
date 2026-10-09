@@ -754,25 +754,43 @@ class BrowserLoginHelper:
         box = await slide.bounding_box()
         if not box:
             return False, "滑块位置不可用"
-        travel = box["width"] * 6  # 兜底：拿不到轨道时按滑块宽 6 倍估算满行程
+        # 一次读取轨道/拖动区/图片/滑块宽度（getBoundingClientRect 优先，offsetWidth 兜底）
+        sizes = None
         for frame in page.frames:
             try:
-                tw = await frame.evaluate("""() => {
-                    const p = document.querySelector('.captcha_drop #slide_path') || document.querySelector('.captcha_drop .slide_path');
-                    if (!p) return null;
-                    return p.getBoundingClientRect().width;
+                sizes = await frame.evaluate("""() => {
+                    const d = document.querySelector('.captcha_drop');
+                    if (!d) return null;
+                    const w = (el) => el ? (el.getBoundingClientRect().width || el.offsetWidth || 0) : 0;
+                    const sp = d.querySelector('#slide_path') || d.querySelector('.slide_path');
+                    const db = d.querySelector('.drag-box');
+                    const sc = d.querySelector('.slot-content');
+                    const sl = d.querySelector('#slider-div') || d.querySelector('.slider-div');
+                    return { slide_path: sp ? w(sp) : 0, drag_box: db ? w(db) : 0, slot: sc ? w(sc) : 0, slider: sl ? w(sl) : 0 };
                 }""")
-                if tw and tw > 0:
-                    travel = tw - box["width"]
+                if sizes:
                     break
             except Exception:
                 continue
+        slider_w = (sizes.get("slider") or 0) if sizes else 0
+        if slider_w <= 5 or (sizes and slider_w > (sizes.get("slide_path") or 0)):
+            slider_w = 45  # 滑块宽异常（IMG 未加载/0）时按常见值估算
+        travel = 0
+        if sizes and sizes.get("slide_path"):
+            travel = sizes["slide_path"] - slider_w
+        elif sizes and sizes.get("drag_box"):
+            travel = sizes["drag_box"] - slider_w
+        elif sizes and sizes.get("slot"):
+            travel = sizes["slot"] - slider_w
+        if travel <= 0:
+            travel = 260  # 兜底经验值（京东旋转题常见行程）
+        logger.info(f"旋转题尺寸: 轨道={sizes.get('slide_path') if sizes else 'N/A'} 拖动区={sizes.get('drag_box') if sizes else 'N/A'} 图片={sizes.get('slot') if sizes else 'N/A'} 滑块={slider_w}, 满行程={int(travel)}px")
         direction = int(self.config.get("jd_browser_rotate_direction", 1))
         angle_norm = angle % 360
         distance = angle_norm / 360 * travel * direction
         if distance < 0:
             distance = -(360 - angle_norm) / 360 * travel * direction  # 反向拖等价距离
-        logger.info(f"旋转题: 识别角度={angle}°, 满行程={int(travel)}px, 拖动距离={int(distance)}px")
+        logger.info(f"旋转题: 识别角度={angle}°, 拖动距离={int(distance)}px")
         await self._drag_human(page, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, distance)
         # 同题微调：弹窗未消失则按 ±30°/±60° 偏移重拖（同一验证码，不重新打码）
         for off_deg in (30, -30, 60, -60):
@@ -2203,7 +2221,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.18)")
+        logger.info("青龙面板插件已加载 (v1.5.19)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -3029,7 +3047,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.18
+        help_text = """📦 青龙面板管理插件 v1.5.19
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
