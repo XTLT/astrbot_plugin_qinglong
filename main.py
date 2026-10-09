@@ -721,7 +721,7 @@ class BrowserLoginHelper:
         # 分隔符形式 "x1,y1;x2,y2;..." 或 "x1,y1|x2,y2" 或空格
         for sep in (";", "|", "\n", " "):
             parts = [p for p in result.split(sep) if p.strip()]
-            if len(parts) >= 2 and all("," in p for p in parts):
+            if len(parts) >= 1 and all("," in p for p in parts):
                 ok = True
                 for p in parts:
                     try:
@@ -933,12 +933,18 @@ class BrowserLoginHelper:
             return False, "未找到轨迹图位置"
         scale_x = img_box["w"] / max(img_box["nw"], 1)
         scale_y = img_box["h"] / max(img_box["nh"], 1)
-        logger.info(f"轨迹题: 识别到 {len(pts)} 个轨迹点, canvas_box={canvas_box}, img_box={img_box}")
+        # 轨迹画在图片显示区域内（画布可能远大于图片），起点取图片左上角
+        base_x = img_box["x"]
+        base_y = img_box["y"]
+        logger.info(f"轨迹题: 识别到 {len(pts)} 个轨迹点, canvas_box={canvas_box}, img_box={img_box}, 绘制起点=({int(base_x)},{int(base_y)})")
+        # 先移动到图片区域中心再按下（避免鼠标从外部快速闯入被风控）
+        await page.mouse.move(base_x + img_box["w"] / 2, base_y + img_box["h"] / 2)
+        await asyncio.sleep(0.2)
         # 起点按下，逐点移动，终点松开
         first = True
         for (px, py) in pts:
-            abs_x = canvas_box["x"] + px * scale_x
-            abs_y = canvas_box["y"] + py * scale_y
+            abs_x = base_x + px * scale_x
+            abs_y = base_y + py * scale_y
             if first:
                 await page.mouse.move(abs_x, abs_y)
                 await page.mouse.down()
@@ -2320,7 +2326,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.24)")
+        logger.info("青龙面板插件已加载 (v1.5.25)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -3146,7 +3152,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.24
+        help_text = """📦 青龙面板管理插件 v1.5.25
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
