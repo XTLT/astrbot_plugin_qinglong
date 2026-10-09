@@ -591,34 +591,76 @@ class BrowserLoginHelper:
     # ------------------------------------------------------------------
     # 验证码题型识别与破解
     # ------------------------------------------------------------------
+    async def _find_in_frames(self, page, selector: str):
+        """在所有 frame（含 iframe）中查找第一个匹配元素。
+        京东验证码组件可能加载在 iframe 中，主文档查询会漏掉。
+        返回 (frame, element_handle)；找不到返回 (None, None)。"""
+        for frame in page.frames:
+            try:
+                el = await frame.query_selector(selector)
+                if el:
+                    return frame, el
+            except Exception:
+                continue
+        return None, None
+
     async def _detect_type(self, page) -> str:
         """检测当前验证码题型：rotate(旋转摆正) / track(轨迹绘制) / gap(缺口拼图) / unknown"""
         try:
-            has_slider = await page.query_selector(".captcha_drop #slider-div")
-            if has_slider is not None:
+            _, slider = await self._find_in_frames(page, ".captcha_drop #slider-div")
+            if slider is not None:
                 return "rotate"
-            text = await page.evaluate("""() => {
-                const d = document.querySelector('.captcha_drop');
-                return d ? (d.innerText || '') : '';
-            }""")
-            if "轨迹" in text or "绘制" in text:
-                return "track"
-            if await page.query_selector(".captcha_drop canvas") is not None:
+            for frame in page.frames:
+                try:
+                    text = await frame.evaluate("""() => {
+                        const d = document.querySelector('.captcha_drop');
+                        return d ? (d.innerText || '') : '';
+                    }""")
+                    if text and ("轨迹" in text or "绘制" in text):
+                        return "track"
+                except Exception:
+                    continue
+            _, canvas = await self._find_in_frames(page, ".captcha_drop canvas")
+            if canvas is not None:
                 return "gap"
+            # 诊断：输出弹窗真实结构，便于适配新题型
+            for frame in page.frames:
+                try:
+                    info = await frame.evaluate("""() => {
+                        const d = document.querySelector('.captcha_drop');
+                        if (!d) return null;
+                        const cls = d.className || '';
+                        const kids = Array.from(d.querySelectorAll('*')).map(e => e.tagName + '#' + (e.id||'') + '.' + (e.className||'').split(' ').slice(0,2).join('.')).slice(0,25);
+                        return { text: (d.innerText||'').slice(0,200), html: (d.innerHTML||'').slice(0,400), cls: cls, kids: kids };
+                    }""")
+                    if info:
+                        logger.info(
+                            f"验证码弹窗诊断 frame={frame.url[:60]}: "
+                            f"class={info.get('cls')!r} text={info.get('text')!r} "
+                            f"kids={info.get('kids')!r}"
+                        )
+                except Exception:
+                    continue
             return "unknown"
         except Exception:
             return "unknown"
 
     async def _extract_image_b64(self, page) -> Optional[str]:
-        """提取验证码弹窗中的主图 base64（去掉 data: 前缀）"""
+        """提取验证码弹窗中的主图 base64（去掉 data: 前缀），支持 iframe"""
         try:
-            src = await page.evaluate("""() => {
-                const d = document.querySelector('.captcha_drop .slot-content img');
-                return d ? d.src : '';
-            }""")
-            if not src or "," not in src:
-                return None
-            return src.split(",", 1)[1]
+            for frame in page.frames:
+                try:
+                    src = await frame.evaluate("""() => {
+                        const d = document.querySelector('.captcha_drop');
+                        if (!d) return '';
+                        const img = d.querySelector('.slot-content img') || d.querySelector('img');
+                        return img ? img.src : '';
+                    }""")
+                    if src and "," in src:
+                        return src.split(",", 1)[1]
+                except Exception:
+                    continue
+            return None
         except Exception:
             return None
 
@@ -696,7 +738,7 @@ class BrowserLoginHelper:
         distance = (angle % 360) * px_per_deg * direction
         if distance < 0:
             distance = 360 * px_per_deg + distance  # 负方向换算为正方向拖动
-        slide = await page.query_selector("#slider-div")
+        _, slide = await self._find_in_frames(page, ".captcha_drop #slider-div")
         if not slide:
             return False, "未找到滑块按钮"
         box = await slide.bounding_box()
@@ -717,13 +759,20 @@ class BrowserLoginHelper:
         pts = self._parse_track_points(result)
         if not pts:
             return False, f"轨迹坐标解析失败: {result[:60]}"
-        # 图片在 slot-content 内，需要相对页面的绝对坐标
-        img_box = await page.evaluate("""() => {
-            const el = document.querySelector('.captcha_drop .slot-content img');
-            if (!el) return null;
-            const r = el.getBoundingClientRect();
-            return {x: r.x, y: r.y, w: r.width, h: r.height, nw: el.naturalWidth, nh: el.naturalHeight};
-        }""")
+        # 图片在 slot-content 内，需要相对页面的绝对坐标（支持 iframe）
+        img_box = None
+        for frame in page.frames:
+            try:
+                img_box = await frame.evaluate("""() => {
+                    const el = document.querySelector('.captcha_drop .slot-content img');
+                    if (!el) return null;
+                    const r = el.getBoundingClientRect();
+                    return {x: r.x, y: r.y, w: r.width, h: r.height, nw: el.naturalWidth, nh: el.naturalHeight};
+                }""")
+                if img_box:
+                    break
+            except Exception:
+                continue
         if not img_box:
             return False, "未找到轨迹图位置"
         scale_x = img_box["w"] / max(img_box["nw"], 1)
@@ -756,7 +805,7 @@ class BrowserLoginHelper:
         x = self._parse_angle(result)
         if x is None:
             return False, f"缺口坐标异常: {result}"
-        slide = await page.query_selector("#slider-div")
+        _, slide = await self._find_in_frames(page, ".captcha_drop #slider-div")
         if not slide:
             return False, "未找到滑块按钮"
         box = await slide.bounding_box()
@@ -764,14 +813,19 @@ class BrowserLoginHelper:
             return False, "滑块位置不可用"
         # 缺口 X 坐标需减去滑块按钮宽度，并乘图片缩放比例
         scale = 1.0
-        img_box = await page.evaluate("""() => {
-            const el = document.querySelector('.captcha_drop .slot-content img');
-            if (!el) return null;
-            const r = el.getBoundingClientRect();
-            return {w: r.width, nw: el.naturalWidth};
-        }""")
-        if img_box and img_box["nw"]:
-            scale = img_box["w"] / img_box["nw"]
+        for frame in page.frames:
+            try:
+                img_box = await frame.evaluate("""() => {
+                    const el = document.querySelector('.captcha_drop .slot-content img');
+                    if (!el) return null;
+                    const r = el.getBoundingClientRect();
+                    return {w: r.width, nw: el.naturalWidth};
+                }""")
+                if img_box and img_box["nw"]:
+                    scale = img_box["w"] / img_box["nw"]
+                    break
+            except Exception:
+                continue
         distance = x * scale - box["width"] * 0.5
         logger.info(f"缺口题: 识别X={x}, 拖动距离={int(distance)}px")
         await self._drag_human(page, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, distance)
@@ -862,7 +916,8 @@ class BrowserLoginHelper:
                 # 等待验证码弹窗
                 appeared = False
                 for _ in range(30):
-                    if await page.query_selector(".captcha_drop"):
+                    _, cap = await self._find_in_frames(page, ".captcha_drop")
+                    if cap:
                         appeared = True
                         break
                     await asyncio.sleep(0.5)
@@ -1953,7 +2008,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.7)")
+        logger.info("青龙面板插件已加载 (v1.5.8)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -2779,7 +2834,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.7
+        help_text = """📦 青龙面板管理插件 v1.5.8
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
