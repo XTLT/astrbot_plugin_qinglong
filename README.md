@@ -1,4 +1,4 @@
-# AstrBot 青龙面板管理插件 v1.5.2
+# AstrBot 青龙面板管理插件 v1.5.3
 
 通过 AstrBot 管理青龙面板的环境变量和定时任务，支持任务执行日志自动推送和定时推送。
 
@@ -97,6 +97,7 @@
 | jd_browser_headless | true | 无头模式运行 Chromium |
 | jd_browser_auto_install | true | 首次使用自动下载 Chromium |
 | jd_browser_download_mirror | npmmirror | Chromium 下载镜像（国内服务器防下载失败） |
+| jd_browser_path | 空 | Chromium 缓存目录（AstrBot 以其他用户运行时，指向共享目录如 /vol1/@appdata/astrbot/ms-playwright） |
 | jd_browser_max_concurrent | 1 | 同时登录会话数（每会话占 200-400MB 内存） |
 | jd_browser_max_retry | 4 | 验证码破解失败换题重试次数 |
 | jd_browser_rotate_px_per_deg | 1.0 | 旋转验证码拖动像素/角度系数 |

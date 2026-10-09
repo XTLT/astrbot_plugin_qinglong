@@ -169,6 +169,11 @@
     "default": "https://npmmirror.com/mirrors/playwright/",
     "description": "Chromium 下载镜像地址（国内服务器直连官方CDN常失败，默认使用 npmmirror 镜像；留空则用官方源）"
   },
+  "jd_browser_path": {
+    "type": "string",
+    "default": "",
+    "description": "Chromium 浏览器缓存目录（留空用系统默认 ~/.cache/ms-playwright；若 AstrBot 以其他用户运行导致找不到浏览器，可指定共享目录如 /vol1/@appdata/astrbot/ms-playwright）"
+  },
   "jd_browser_max_concurrent": {
     "type": "int",
     "default": 1,

@@ -434,6 +434,16 @@ class BrowserLoginHelper:
                 return True, "ok"
             import sys, os
 
+            # 自定义浏览器缓存目录：AstrBot 若以非当前用户运行（如飞牛OS 应用容器用户），
+            # 标准 home 缓存路径不可用，可配置 jd_browser_path 指向共享目录
+            bpath = (self.config.get("jd_browser_path") or "").strip()
+            if bpath:
+                os.environ["PLAYWRIGHT_BROWSERS_PATH"] = bpath
+                try:
+                    os.makedirs(bpath, exist_ok=True)
+                except Exception:
+                    pass
+
             # 1. 检查是否已安装
             exe = self._chromium_executable()
             if not exe or not os.path.exists(exe):
@@ -1892,7 +1902,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.2)")
+        logger.info("青龙面板插件已加载 (v1.5.3)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -2718,7 +2728,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.2
+        help_text = """📦 青龙面板管理插件 v1.5.3
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
