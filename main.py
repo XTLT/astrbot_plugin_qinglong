@@ -463,13 +463,17 @@ class BrowserLoginHelper:
                 bpath = self._find_existing_browser_path()
             if bpath:
                 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = bpath
+                logger.info(f"浏览器缓存目录: {bpath}")
                 try:
                     os.makedirs(bpath, exist_ok=True)
                 except Exception:
                     pass
+            else:
+                logger.info("浏览器缓存目录: 未指定（将使用系统默认路径）")
 
             # 1. 检查是否已安装
             exe = self._chromium_executable()
+            logger.info(f"Chromium 检查结果: {exe}")
             if not exe or not os.path.exists(exe):
                 if not self.config.get("jd_browser_auto_install", True):
                     return False, (
@@ -1926,7 +1930,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.4)")
+        logger.info("青龙面板插件已加载 (v1.5.5)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -2752,7 +2756,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.4
+        help_text = """📦 青龙面板管理插件 v1.5.5
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
