@@ -389,6 +389,10 @@ class BrowserLoginHelper:
 
     JD_LOGIN_URL = "https://passport.jd.com/uc/login"
 
+    def _get_login_url(self) -> str:
+        """登录页地址：默认 PC 端；可配置切换 M 端（风控更弱，发码题型为箭头拼图）"""
+        return (self.config.get("jd_login_url") or self.JD_LOGIN_URL).strip() or self.JD_LOGIN_URL
+
     def __init__(self, config: dict, plugin: 'QinglongPlugin'):
         self.config = config
         self.plugin = plugin
@@ -1223,21 +1227,33 @@ class BrowserLoginHelper:
                     await asyncio.sleep(2.5)
                 except Exception:
                     pass
-                await page.goto(self.JD_LOGIN_URL, timeout=60000, wait_until="domcontentloaded")
+                await page.goto(self._get_login_url(), timeout=60000, wait_until="domcontentloaded")
                 await asyncio.sleep(5)
-                # 切到短信登录 tab
-                await page.evaluate("""() => { document.querySelector('#sms-login').click(); }""")
+                # 切到短信登录 tab（PC端 #sms-login；M端可能默认短信或文本按钮）
+                await page.evaluate("""() => {
+                    const el = document.querySelector('#sms-login')
+                        || Array.from(document.querySelectorAll('div,span,a,li')).find(e => /短信登录/.test(e.textContent || '') && e.children.length <= 3 && (e.textContent || '').trim().length <= 10);
+                    if (el) el.click();
+                }""")
                 await asyncio.sleep(1.5)
-                # 输入手机号
+                # 输入手机号（PC端 #mobile-number；M端/通用 input[type=tel] 或 placeholder 含手机号）
                 mb = await page.query_selector("#mobile-number")
+                if not mb:
+                    mb = await page.query_selector("input[type='tel']")
+                if not mb:
+                    mb = await page.query_selector("input[placeholder*='手机号'], input[name*='mobile'], input[name*='phone']")
                 if not mb:
                     await context.close()
                     return False, "登录页未加载完整（短信表单未出现），请稍后重试"
                 await mb.click(force=True)
                 await page.keyboard.type(phone, delay=40)
                 await asyncio.sleep(0.5)
-                # 点击获取验证码
-                await page.evaluate("""() => { document.querySelector('#send-sms-code-btn').click(); }""")
+                # 点击获取验证码（PC端 #send-sms-code-btn；M端文本按钮兜底）
+                await page.evaluate("""() => {
+                    const el = document.querySelector('#send-sms-code-btn')
+                        || Array.from(document.querySelectorAll('button,a,div,span')).find(e => /(获取验证码|发送验证码)/.test(e.textContent || '') && e.children.length <= 2);
+                    if (el) el.click();
+                }""")
                 # 等待验证码弹窗
                 appeared = False
                 for _ in range(30):
@@ -1327,11 +1343,18 @@ class BrowserLoginHelper:
         try:
             code_input = await page.query_selector("#sms-code")
             if not code_input:
+                code_input = await page.query_selector("input[placeholder*='验证码'], input[name*='code'], input[type='number']")
+            if not code_input:
                 return False, "验证码输入框不可用", ""
             await code_input.click(force=True)
             await page.keyboard.type(code, delay=60)
             await asyncio.sleep(0.5)
-            await page.evaluate("""() => { document.querySelector('#sms-login-submit').click(); }""")
+            await page.evaluate("""() => {
+                const el = document.querySelector('#sms-login-submit')
+                    || document.querySelector('#login-btn')
+                    || Array.from(document.querySelectorAll('button,a,div')).find(e => /(登录|登 录)/.test(e.textContent || '') && e.children.length <= 3);
+                if (el) el.click();
+            }""")
 
             # 等待跳转或错误提示（最长 20 秒）
             login_url = page.url
@@ -2355,7 +2378,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.28)")
+        logger.info("青龙面板插件已加载 (v1.5.29)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -3181,7 +3204,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.28
+        help_text = """📦 青龙面板管理插件 v1.5.29
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量

@@ -154,6 +154,11 @@
     "default": true,
     "description": "是否启用浏览器登录助手（真实 Chromium + 打码平台破解验证码，替代已被京东风控的纯HTTP发码）"
   },
+  "jd_login_url": {
+    "type": "string",
+    "default": "https://passport.jd.com/uc/login",
+    "description": "京东登录页地址。默认 PC 端；如触发认证魔方/人脸风控，可改为 M 端 https://plogin.m.jd.com/login/login（风控更弱，验证码题型为箭头拼图）"
+  },
   "jd_browser_headless": {
     "type": "bool",
     "default": true,
