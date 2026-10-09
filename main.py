@@ -743,21 +743,44 @@ class BrowserLoginHelper:
         angle = self._parse_angle(result)
         if angle is None:
             return False, f"角度识别结果异常: {result}"
-        # 拖动距离 = 角度 * px/度（方向与比例可配置，实测校准）
-        px_per_deg = float(self.config.get("jd_browser_rotate_px_per_deg", 1.0))
-        direction = int(self.config.get("jd_browser_rotate_direction", 1))
-        distance = (angle % 360) * px_per_deg * direction
-        if distance < 0:
-            distance = 360 * px_per_deg + distance  # 负方向换算为正方向拖动
+        # 动态换算：图片旋转 360° = 滑块拖满轨道（轨道宽 - 滑块宽），不依赖固定 px/度
         _, slide = await self._find_in_frames(page, ".captcha_drop #slider-div")
         if not slide:
             return False, "未找到滑块按钮"
         box = await slide.bounding_box()
         if not box:
             return False, "滑块位置不可用"
-        logger.info(f"旋转题: 识别角度={angle}°, 拖动距离={int(distance)}px")
+        travel = box["width"] * 6  # 兜底：拿不到轨道时按滑块宽 6 倍估算满行程
+        for frame in page.frames:
+            try:
+                tw = await frame.evaluate("""() => {
+                    const p = document.querySelector('.captcha_drop #slide_path') || document.querySelector('.captcha_drop .slide_path');
+                    if (!p) return null;
+                    return p.getBoundingClientRect().width;
+                }""")
+                if tw and tw > 0:
+                    travel = tw - box["width"]
+                    break
+            except Exception:
+                continue
+        direction = int(self.config.get("jd_browser_rotate_direction", 1))
+        angle_norm = angle % 360
+        distance = angle_norm / 360 * travel * direction
+        if distance < 0:
+            distance = -(360 - angle_norm) / 360 * travel * direction  # 反向拖等价距离
+        logger.info(f"旋转题: 识别角度={angle}°, 满行程={int(travel)}px, 拖动距离={int(distance)}px")
         await self._drag_human(page, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, distance)
-        return True, f"已按 {angle}° 拖动"
+        # 同题微调：弹窗未消失则按 ±30°/±60° 偏移重拖（同一验证码，不重新打码）
+        for off_deg in (30, -30, 60, -60):
+            if await self._wait_captcha_gone(page, timeout_s=2.5):
+                return True, f"已按 {angle}° 拖动"
+            nb = await slide.bounding_box()
+            if not nb:
+                break
+            d2 = (angle_norm + off_deg) / 360 * travel * direction
+            logger.info(f"旋转题同题微调: 偏移 {off_deg:+d}°")
+            await self._drag_human(page, nb["x"] + nb["width"] / 2, nb["y"] + nb["height"] / 2, d2)
+        return True, f"已按 {angle}° 拖动（含微调）"
 
     async def _solve_track(self, page) -> Tuple[bool, str]:
         """破解轨迹绘制题：打码识别轨迹坐标 → 在 #trackLine 画布上按 #cpc_img 轨迹绘制"""
@@ -2122,7 +2145,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.16)")
+        logger.info("青龙面板插件已加载 (v1.5.17)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -2948,7 +2971,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.16
+        help_text = """📦 青龙面板管理插件 v1.5.17
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
