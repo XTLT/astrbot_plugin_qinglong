@@ -629,8 +629,12 @@ class BrowserLoginHelper:
                     info = await frame.evaluate("""() => {
                         const d = document.querySelector('.captcha_drop');
                         if (!d) return null;
-                        const cls = d.className || '';
-                        const kids = Array.from(d.querySelectorAll('*')).map(e => e.tagName + '#' + (e.id||'') + '.' + (e.className||'').split(' ').slice(0,2).join('.')).slice(0,25);
+                        const cls = (typeof d.className === 'string') ? d.className : ((d.className && d.className.baseVal) || '');
+                        const kids = Array.from(d.querySelectorAll('*')).map(e => {
+                            let cn = '';
+                            try { cn = (typeof e.className === 'string') ? e.className : ((e.className && e.className.baseVal) || ''); } catch (err) { cn = ''; }
+                            return e.tagName + '#' + (e.id || '') + '.' + cn.split(' ').slice(0,2).join('.');
+                        }).slice(0,25);
                         return { text: (d.innerText||'').slice(0,200), html: (d.innerHTML||'').slice(0,400), cls: cls, kids: kids };
                     }""")
                     if info:
@@ -2019,7 +2023,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.9)")
+        logger.info("青龙面板插件已加载 (v1.5.10)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -2845,7 +2849,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.9
+        help_text = """📦 青龙面板管理插件 v1.5.10
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
