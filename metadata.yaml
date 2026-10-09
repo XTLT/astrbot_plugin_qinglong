@@ -1,6 +1,6 @@
 name: astrbot_plugin_qinglong_manage
 display_name: 青龙面板管理
 desc: 通过聊天管理青龙面板，支持任务管理、环境变量、日志查看、自动推送及定时推送，支持群内自动保存/更新Cookie与京东短信验证码登录（真实浏览器自动破解验证码）
-version: v1.5.8
+version: v1.5.9
 author: tension
 repo: https://github.com/XTLT/astrbot_plugin_qinglong

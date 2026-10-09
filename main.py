@@ -623,7 +623,7 @@ class BrowserLoginHelper:
             _, canvas = await self._find_in_frames(page, ".captcha_drop canvas")
             if canvas is not None:
                 return "gap"
-            # 诊断：输出弹窗真实结构，便于适配新题型
+            # 诊断：无条件输出弹窗结构（含所有 frame），便于适配新题型
             for frame in page.frames:
                 try:
                     info = await frame.evaluate("""() => {
@@ -635,12 +635,14 @@ class BrowserLoginHelper:
                     }""")
                     if info:
                         logger.info(
-                            f"验证码弹窗诊断 frame={frame.url[:60]}: "
+                            f"验证码弹窗诊断 frame={frame.url[:80]}: "
                             f"class={info.get('cls')!r} text={info.get('text')!r} "
                             f"kids={info.get('kids')!r}"
                         )
-                except Exception:
-                    continue
+                    else:
+                        logger.info(f"验证码弹窗诊断 frame={frame.url[:80]}: 无 .captcha_drop")
+                except Exception as e:
+                    logger.info(f"验证码弹窗诊断 frame={frame.url[:80]} 访问失败: {str(e)[:120]}")
             return "unknown"
         except Exception:
             return "unknown"
@@ -930,6 +932,15 @@ class BrowserLoginHelper:
                         return True, "ok"
                     await context.close()
                     return False, f"未弹出验证码且未发送成功：{body[:120]}"
+
+                # 保存验证码弹窗截图（诊断用，登录失败后可查看弹窗真实内容）
+                try:
+                    import tempfile, os as _os
+                    shot = _os.path.join(tempfile.gettempdir(), f"jd_captcha_{int(time.time())}.png")
+                    await page.screenshot(path=shot)
+                    logger.info(f"验证码弹窗截图已保存: {shot}")
+                except Exception as e:
+                    logger.info(f"验证码弹窗截图失败: {str(e)[:120]}")
 
                 # 破解验证码（重试循环）
                 max_retry = max(int(self.config.get("jd_browser_max_retry", 4)), 1)
@@ -2008,7 +2019,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.8)")
+        logger.info("青龙面板插件已加载 (v1.5.9)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -2834,7 +2845,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.8
+        help_text = """📦 青龙面板管理插件 v1.5.9
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
