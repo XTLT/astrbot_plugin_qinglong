@@ -427,6 +427,27 @@ class BrowserLoginHelper:
         except Exception as e:
             return False, str(e)
 
+    def _find_existing_browser_path(self) -> str:
+        """自动探测已存在的 Chromium 缓存目录（标准 home 缓存之外的常见共享目录）。
+        返回可用的缓存根目录；找不到返回空字符串。"""
+        import glob
+        candidates = [
+            "/vol1/@appdata/astrbot/ms-playwright",
+            "/opt/ms-playwright",
+            "/var/lib/ms-playwright",
+            "/usr/local/share/ms-playwright",
+            "/tmp/ms-playwright",
+            "/data/ms-playwright",
+        ]
+        for cand in candidates:
+            try:
+                hits = glob.glob(os.path.join(cand, "chromium-*", "chrome-linux64", "chrome"))
+                if hits:
+                    return cand
+            except Exception:
+                continue
+        return ""
+
     async def ensure_browser(self) -> Tuple[bool, str]:
         """检测 / 自动安装 / 启动 Chromium。返回 (ok, 消息)"""
         async with self._install_lock:
@@ -434,9 +455,12 @@ class BrowserLoginHelper:
                 return True, "ok"
             import sys, os
 
-            # 自定义浏览器缓存目录：AstrBot 若以非当前用户运行（如飞牛OS 应用容器用户），
-            # 标准 home 缓存路径不可用，可配置 jd_browser_path 指向共享目录
+            # 浏览器缓存目录优先级：配置项 jd_browser_path > 自动探测共享目录 > 系统默认
+            # AstrBot 若以非当前用户运行（如飞牛OS 应用容器用户），标准 home 缓存路径不可用，
+            # 需要指向手动安装到共享目录的 Chromium
             bpath = (self.config.get("jd_browser_path") or "").strip()
+            if not bpath:
+                bpath = self._find_existing_browser_path()
             if bpath:
                 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = bpath
                 try:
@@ -1902,7 +1926,7 @@ class QinglongPlugin(Star):
         self.sms_phone_cooldown: Dict[str, float] = {}  # phone -> 上次发码时间
         self.sms_intents: Dict[str, float] = {}         # uid -> 触发"登录"的时间（必须先登录才能发手机号）
         
-        logger.info("青龙面板插件已加载 (v1.5.3)")
+        logger.info("青龙面板插件已加载 (v1.5.4)")
         logger.info(f"  Host: {ql_host}")
         logger.info(f"  实时推送功能: {'启用' if config.get('log_push_enabled', True) else '禁用'}")
         logger.info(f"  定时推送功能: {'启用' if config.get('log_schedule_enabled', True) else '禁用'}")
@@ -2728,7 +2752,7 @@ class QinglongPlugin(Star):
     
     async def _handle_help(self, event: AstrMessageEvent, parts: list):
         """显示帮助信息"""
-        help_text = """📦 青龙面板管理插件 v1.5.3
+        help_text = """📦 青龙面板管理插件 v1.5.4
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
